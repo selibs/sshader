@@ -320,7 +320,7 @@ class Tests extends RectLayer implements ShaderSource {
 		return parent + 1;
 	}
 
-	function __vert__(inputMode:ShaderMode, qualityIn:Quality, seed:Int):{
+	function vert(inputMode:ShaderMode, qualityIn:Quality, seed:Int):{
 		@location(0) @flat var fragColor:Int;
 		@location(1) @smooth(centroid) var fragPos:Float;
 	} {
@@ -497,7 +497,7 @@ class Tests extends RectLayer implements ShaderSource {
 		return null;
 	}
 
-	function __frag__(inputMode:ShaderMode, qualityIn:Quality, seed:Int):FragOut {
+	function frag(inputMode:ShaderMode, qualityIn:Quality, seed:Int):FragOut {
 		var base = StaticMath.foldRange(1, 4);
 		var mixed = StaticMath.applyMode(inputMode, seed + base + qualityIn);
 		var modeB = StaticMath.pickMode(mixed, qualityIn);
