@@ -1,0 +1,11 @@
+{
+    "name": "sshader",
+    "url": "https://github.com/selibs/sshader",
+    "license": "Apache",
+    "tags": ["glsl", "shader", "vertex", "fragment"],
+    "version": "0.0.1",
+    "classPath": "src",
+    "description": "A library for writing shaders in Haxe",
+    "contributors": ["smoothie"],
+    "releasenote": "Init"
+}
