@@ -1,30 +1,8 @@
 package sshader.transpiler;
 
+import sshader.ShaderSource;
+
 #if macro
-enum AuxInterp {
-	NONE;
-	CENTROID;
-	SAMPLE;
-}
-
-enum VaryingInterp {
-	FLAT;
-	SMOOTH(a:AuxInterp);
-	NOPERSPECTIVE(a:AuxInterp);
-}
-
-typedef Varying = {
-	name:String,
-	type:TypeDef,
-	location:Int,
-	interp:VaryingInterp
-}
-
-typedef TypeDef = {
-	def:Array<String>,
-	name:String
-}
-
 typedef EntryPointBody = {
 	statics:Array<String>,
 	expr:String

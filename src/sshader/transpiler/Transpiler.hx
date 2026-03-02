@@ -4,6 +4,7 @@ package sshader.transpiler;
 import haxe.macro.Context;
 import haxe.macro.Expr;
 import haxe.macro.Type;
+import sshader.ShaderSource;
 import sshader.transpiler.Types;
 
 using haxe.macro.TypeTools;
@@ -11,91 +12,38 @@ using haxe.macro.ComplexTypeTools;
 using haxe.macro.TypedExprTools;
 
 class Transpiler {
-	public static function buildShaderSource(field:ClassField) {
+	public static function buildShaderSource(owner:ClassType, field:ClassField):ShaderSource {
 		switch field.expr().expr {
 			case TFunction(tfunc):
 				var prevEntryTypes = TypeSupport.curDefinedTypes;
 				var prevDispatchers = TypeSupport.curDispatchers;
 				var prevDispatcherSeq = TypeSupport.curDispatcherSeq;
 				var prevHelperSeq = TypeSupport.curHelperSeq;
+				var prevUniformFields = TypeSupport.curUniformFields;
+				var prevInlineNoThisMethods = TypeSupport.curInlineNoThisMethods;
 				TypeSupport.curDefinedTypes = new Map();
 				TypeSupport.curDispatchers = new Map();
 				TypeSupport.curDispatcherSeq = 0;
 				TypeSupport.curHelperSeq = 0;
+				TypeSupport.curInlineNoThisMethods = new Map();
 
-				var buf = new StringBuf();
 				var p = Transpiler.entryPoint(tfunc, field.pos);
-				var body = p.body.expr;
-				var statics = p.body.statics;
-                
-				function addVarying(v:Varying, d:String) {
-					function addTypeDef(t:TypeDef) {
-						statics = statics.concat(t.def);
-						return t.name;
-					}
-					var interp = switch v.interp {
-						case FLAT:
-							"flat";
-						case SMOOTH(v):
-							"smooth" + switch v {
-								case NONE: "";
-								case CENTROID: " centroid";
-								case SAMPLE: " sample";
-							}
-						case NOPERSPECTIVE(v):
-							"noperspective" + switch v {
-								case NONE: "";
-								case CENTROID: " centroid";
-								case SAMPLE: " sample";
-							}
-					}
-					buf.add('layout(location = ${v.location}) $interp $d ${addTypeDef(v.type)} ${v.name};\n');
-				}
 
-				// version
-				if (ShaderSourceBuilder.VERSION != null)
-					buf.add('#version ${ShaderSourceBuilder.VERSION}\n\n');
+				var s = new ShaderSource();
+				s.uniforms = TypeSupport.collectUniforms(owner, true);
+				s.varIn = p.varIn;
+				s.varOut = p.varOut;
+				s.statics = p.body.statics;
+				s.body = p.body.expr;
 
-				// in
-				var vin = p.varIn;
-				if (vin.length > 0) {
-					for (i in 0...vin.length)
-						addVarying(vin[i], "in");
-					buf.add("\n");
-				}
-
-				// out
-				var vout = p.varOut;
-				if (vout.length > 0) {
-					for (i in 0...vout.length)
-						addVarying(vout[i], "out");
-					buf.add("\n");
-				}
-
-				// statics
-				statics = statics.concat(buildDispatchers());
-				var uniqueStatics = new Map<String, Bool>();
-				for (s in statics) {
-					if (s.length == 0 || uniqueStatics.exists(s))
-						continue;
-					uniqueStatics.set(s, true);
-					buf.add(s + "\n");
-				}
-
-				// body
-				if (body.length > 0) {
-					buf.add("void main() ");
-					buf.add(body);
-					buf.add("\n");
-				}
-
-				var result = buf.toString();
 				TypeSupport.curDefinedTypes = prevEntryTypes;
 				TypeSupport.curDispatchers = prevDispatchers;
 				TypeSupport.curDispatcherSeq = prevDispatcherSeq;
 				TypeSupport.curHelperSeq = prevHelperSeq;
+				TypeSupport.curUniformFields = prevUniformFields;
+				TypeSupport.curInlineNoThisMethods = prevInlineNoThisMethods;
 
-				return result;
+				return s;
 			default:
 				Context.error("Shader entry point should be function", field.pos);
 				return null;
@@ -240,6 +188,162 @@ class Transpiler {
 			return addTypeDef(TypeSupport.defType(TInst(t, params), expr.pos));
 		function addModuleType(t:ModuleType)
 			return addTypeDef(TypeSupport.defModuleType(t));
+		function isVarField(field:ClassField):Bool {
+			return switch field.kind {
+				case FVar(_, _):
+					true;
+				default:
+					false;
+			}
+		}
+		function assertNonLocalVarAccess(field:ClassField, owner:ClassType, p:Position) {
+			if (TypeSupport.uniformNameForField(owner, field) != null || field.isFinal)
+				return;
+			if (TypeSupport.isShaderSourceClass(owner))
+				Context.error('Non-local mutable field "${owner.name}.${field.name}" is not allowed in shader code.', p);
+		}
+		function isNoThisInlineMethod(owner:ClassType, field:ClassField):Bool {
+			if (owner.isExtern || field.meta.has(":native"))
+				return false;
+			return TypeSupport.isNoThisInlineMethod(owner, field);
+		}
+		function isNoThisMethod(owner:ClassType, field:ClassField):Bool {
+			if (owner.isExtern || field.meta.has(":native"))
+				return false;
+			return TypeSupport.isNoThisMethod(owner, field);
+		}
+		function inlineNoThisMethodKey(owner:ClassType, field:ClassField):String {
+			var p = Context.getPosInfos(field.pos);
+			return TypeSupport.classBaseName(owner) + ":" + field.name + ":" + p.min + ":" + p.max;
+		}
+		function ensureNoThisInlineMethod(owner:ClassType, field:ClassField):String {
+			var helperKey = inlineNoThisMethodKey(owner, field);
+			if (TypeSupport.curInlineNoThisMethods == null)
+				TypeSupport.curInlineNoThisMethods = new Map();
+			var existing = TypeSupport.curInlineNoThisMethods.get(helperKey);
+			if (existing != null)
+				return existing;
+			var helperName = TypeSupport.sanitizeIdent(TypeSupport.classBaseName(owner) + "_" + field.name + "__inline_nothis");
+			TypeSupport.curInlineNoThisMethods.set(helperKey, helperName);
+			function helperTypeName(t:Type, p:Position):String {
+				var td = TypeSupport.defType(t, p);
+				for (s in td.def)
+					statics.push(s);
+				return td.name;
+			}
+
+			var signature = switch field.type.follow() {
+				case TFun(args, ret):
+					{
+						args: args,
+						ret: ret
+					};
+				default:
+					Context.error('Expected function type for inline method ${field.name}', field.pos);
+					{
+						args: [],
+						ret: field.type
+					};
+			}
+			var retType = helperTypeName(signature.ret, field.pos);
+			var methodCtx:TransContext = {
+				locals: new Map(),
+				usedLocalNames: new Map()
+			};
+			function reserveArgName(raw:String):String {
+				var base = TypeSupport.sanitizeIdent(raw);
+				if (base == "_" || base == "this" || base == "__self")
+					base = "__arg";
+				var count = methodCtx.usedLocalNames.get(base);
+				if (count == null) {
+					methodCtx.usedLocalNames.set(base, 1);
+					return base;
+				}
+				var name = base + "_" + count;
+				var i = count + 1;
+				while (methodCtx.usedLocalNames.exists(name)) {
+					name = base + "_" + i;
+					i++;
+				}
+				methodCtx.usedLocalNames.set(base, i);
+				methodCtx.usedLocalNames.set(name, 1);
+				return name;
+			}
+			var argsDecl = [];
+			var argNames:Array<String> = [];
+			for (arg in signature.args) {
+				var argType = helperTypeName(arg.t, field.pos);
+				var argName = reserveArgName(arg.name);
+				argNames.push(argName);
+				argsDecl.push(argType + " " + argName);
+			}
+			var methodExpr = field.expr();
+			if (methodExpr == null)
+				Context.error('Method ${field.name} should have a body', field.pos);
+			function unwrapInlineExpr(e:TypedExpr):TypedExpr {
+				var cur = e;
+				while (true)
+					switch cur.expr {
+						case TMeta(_, inner):
+							cur = inner;
+						case TParenthesis(inner):
+							cur = inner;
+						case TCast(inner, null):
+							cur = inner;
+						case TBlock(el) if (el.length == 1):
+							cur = el[0];
+						default:
+							return cur;
+					}
+				return cur;
+			}
+			function extractInlineValue(e:TypedExpr):Null<TypedExpr> {
+				var u = unwrapInlineExpr(e);
+				return switch u.expr {
+					case TReturn(v):
+						v;
+					case TBlock(el) if (el.length == 1):
+						extractInlineValue(el[0]);
+					default:
+						null;
+				}
+			}
+			var methodFunc:Null<TFunc> = switch methodExpr.expr {
+				case TFunction(func):
+					func;
+				default:
+					null;
+			}
+			if (methodFunc != null)
+				for (i in 0...methodFunc.args.length)
+					if (i < argNames.length)
+						methodCtx.locals.set(methodFunc.args[i].v.id, argNames[i]);
+			var bodyExpr = methodFunc != null ? methodFunc.expr : methodExpr;
+			var inlineValueExpr = extractInlineValue(bodyExpr);
+			if (inlineValueExpr != null) {
+				var inlined = transExpr(inlineValueExpr, false, false, 0, false, methodCtx);
+				for (s in inlined.statics)
+					statics.push(s);
+				statics.push("#define " + helperName + "(" + argNames.join(", ") + ") (" + inlined.expr + ")");
+				return helperName;
+			}
+			var body = switch methodExpr.expr {
+				case TFunction(func):
+					transExpr(func.expr, false, false, 0, false, methodCtx);
+				default:
+					transExpr(methodExpr, false, false, 0, false, methodCtx);
+			}
+			for (s in body.statics)
+				statics.push(s);
+			var b = new StringBuf();
+			b.add(retType + " " + helperName + "(" + argsDecl.join(", ") + ") ");
+			if (body.expr.length > 0 && body.expr.charAt(0) == "{")
+				b.add(body.expr + "\n");
+			else
+				b.add("{\n\t" + body.expr + ";\n}\n");
+			statics.push(b.toString());
+			return helperName;
+		}
 		function isFunctionType(t:Type):Bool {
 			return switch t.follow() {
 				case TFun(_, _):
@@ -329,6 +433,100 @@ class Transpiler {
 					false;
 				default:
 					true;
+			}
+		}
+		function collectLocalUseCounts(el:Array<TypedExpr>):Map<Int, Int> {
+			var out = new Map<Int, Int>();
+			function bump(id:Int) {
+				var cur = out.get(id);
+				out.set(id, cur == null ? 1 : (cur + 1));
+			}
+			function visit(node:TypedExpr) {
+				var u = unwrapWrapperExpr(node);
+				switch u.expr {
+					case TField(_, FInstance(c, _, cf)):
+						if (isNoThisMethod(c.get(), cf.get()))
+							return;
+					case TField(_, FClosure(c, cf)):
+						if (c != null && isNoThisMethod(c.c.get(), cf.get()))
+							return;
+					case TCall(callee, args):
+						var uCallee = unwrapWrapperExpr(callee);
+						switch uCallee.expr {
+							case TField(_, FInstance(c, _, cf)):
+								if (isNoThisMethod(c.get(), cf.get())) {
+									for (a in args)
+										visit(a);
+									return;
+								}
+							default:
+						}
+					default:
+				}
+				switch u.expr {
+					case TLocal(v):
+						bump(v.id);
+					default:
+				}
+				u.iter(visit);
+			}
+			for (stmt in el)
+				visit(stmt);
+			return out;
+		}
+		function isPureExpr(e:TypedExpr):Bool {
+			var u = unwrapWrapperExpr(e);
+			return switch u.expr {
+				case TConst(_), TLocal(_), TTypeExpr(_):
+					true;
+				case TParenthesis(inner):
+					isPureExpr(inner);
+				case TCast(inner, _):
+					isPureExpr(inner);
+				case TMeta(_, inner):
+					isPureExpr(inner);
+				case TArray(a, b): isPureExpr(a) && isPureExpr(b);
+				case TObjectDecl(fields):
+					var pure = true;
+					for (f in fields)
+						if (!isPureExpr(f.expr)) {
+							pure = false;
+							break;
+						}
+					pure;
+				case TArrayDecl(values):
+					var pure = true;
+					for (v in values)
+						if (!isPureExpr(v)) {
+							pure = false;
+							break;
+						}
+					pure;
+				case TBinop(op, a, b):
+					switch op {
+						case OpAssign, OpAssignOp(_):
+							false;
+						default: isPureExpr(a) && isPureExpr(b);
+					}
+				case TUnop(op, _, inner):
+					switch op {
+						case OpIncrement, OpDecrement:
+							false;
+						default:
+							isPureExpr(inner);
+					}
+				case TNew(c, _, args):
+					if (!TypeSupport.isStatelessTrivialCtorClass(c.get())) false; else {
+						var pure = true;
+						for (a in args)
+							if (!isPureExpr(a)) {
+								pure = false;
+								break;
+							}
+						pure;
+					}
+				default:
+					false;
 			}
 		}
 		function nextHelperName(prefix:String):String {
@@ -457,6 +655,8 @@ class Transpiler {
 				case TFunction(func):
 					lowerLambdaFunction(func, sigType, u.pos);
 				case TField(_, FStatic(c, cf)):
+					if (isVarField(cf.get()))
+						assertNonLocalVarAccess(cf.get(), c.get(), u.pos);
 					if (c.get().isExtern || cf.get().meta.has(":native")) {
 						target: TypeSupport.fieldNativeName(cf.get()),
 						captures: []
@@ -474,14 +674,27 @@ class Transpiler {
 						captures: []
 					};
 				case TField(target, FInstance(c, params, cf)):
+					if (isVarField(cf.get()))
+						assertNonLocalVarAccess(cf.get(), c.get(), u.pos);
 					var owner = c.get();
-					var selfType = typeNameOfExprType(target.t, target.pos);
 					if (owner.isExtern || cf.get().meta.has(":native")) {
+						var selfType = typeNameOfExprType(target.t, target.pos);
 						var helperName = nextHelperName("__fn_bound_");
 						statics.push(buildBoundMethodWrapper(helperName, retType, TypeSupport.fieldNativeName(cf.get()), selfType, argTypes, true));
 						{
 							target: helperName,
 							captures: [{t: target.t, expr: addInline(target)}]
+						};
+					} else if (isNoThisInlineMethod(owner, cf.get())) {
+						{
+							target: ensureNoThisInlineMethod(owner, cf.get()),
+							captures: []
+						};
+					} else if (isNoThisMethod(owner, cf.get())) {
+						var className = addClassType(c, params);
+						{
+							target: className + "_" + TypeSupport.sanitizeIdent(cf.get().name),
+							captures: []
 						};
 					} else {
 						var className = addClassType(c, params);
@@ -500,13 +713,24 @@ class Transpiler {
 							};
 						case cc:
 							var owner = cc.c.get();
-							var selfType = typeNameOfExprType(target.t, target.pos);
 							if (owner.isExtern || cf.get().meta.has(":native")) {
+								var selfType = typeNameOfExprType(target.t, target.pos);
 								var helperName = nextHelperName("__fn_bound_");
 								statics.push(buildBoundMethodWrapper(helperName, retType, TypeSupport.fieldNativeName(cf.get()), selfType, argTypes, true));
 								{
 									target: helperName,
 									captures: [{t: target.t, expr: addInline(target)}]
+								};
+							} else if (isNoThisInlineMethod(owner, cf.get())) {
+								{
+									target: ensureNoThisInlineMethod(owner, cf.get()),
+									captures: []
+								};
+							} else if (isNoThisMethod(owner, cf.get())) {
+								var className = addClassType(cc.c, cc.params);
+								{
+									target: className + "_" + TypeSupport.sanitizeIdent(cf.get().name),
+									captures: []
 								};
 							} else {
 								var className = addClassType(cc.c, cc.params);
@@ -660,7 +884,8 @@ class Transpiler {
 			var branch = unwrapWrapperExpr(e);
 			switch branch.expr {
 				case TBlock(_):
-					buf.add(addExpr(branch, false, false, d));
+					// block already carries its own internal indentation; avoid extra tabs before "{"
+					buf.add(addExpr(branch, false, false, d, false));
 				default:
 					buf.add("{\n");
 					emitStatement(branch, d + 1);
@@ -701,17 +926,27 @@ class Transpiler {
 						var owner = c.get();
 						switch field.kind {
 							case FVar(_, _):
-								buf.add(addInline(e) + "." + TypeSupport.fieldNativeName(field));
+								assertNonLocalVarAccess(field, owner, expr.pos);
+								var uniformName = TypeSupport.uniformNameForField(owner, field);
+								if (uniformName != null) buf.add(uniformName); else buf.add(addInline(e) + "." + TypeSupport.fieldNativeName(field));
 							case FMethod(_):
 								if (owner.isExtern || field.meta.has(":native")) buf.add(addInline(e) + "." + TypeSupport.fieldNativeName(field)); else {
-									var className = addClassType(c, params);
-									buf.add(className + "_" + TypeSupport.sanitizeIdent(field.name));
+									if (isNoThisInlineMethod(owner, field))
+										buf.add(ensureNoThisInlineMethod(owner, field));
+									else {
+										var className = addClassType(c, params);
+										buf.add(className + "_" + TypeSupport.sanitizeIdent(field.name));
+									}
 								}
 						}
 					case FStatic(c, cf):
 						var owner = c.get();
 						var field = cf.get();
-						if (owner.isExtern || field.meta.has(":native")) buf.add(TypeSupport.fieldNativeName(field)); else {
+						if (isVarField(field))
+							assertNonLocalVarAccess(field, owner, expr.pos);
+						var uniformName = TypeSupport.uniformNameForField(owner, field);
+						if (uniformName != null) buf.add(uniformName); else if (owner.isExtern || field.meta.has(":native"))
+							buf.add(TypeSupport.fieldNativeName(field)); else {
 							var className = addClassType(c, []);
 							buf.add(className + "_" + TypeSupport.sanitizeIdent(field.name));
 						}
@@ -720,18 +955,17 @@ class Transpiler {
 					case FDynamic(s):
 						buf.add(addInline(e) + "." + TypeSupport.sanitizeIdent(s));
 					case FClosure(c, cf):
-						var owner = switch c {
-							case null:
-								null;
-							case v:
-								addClassType(v.c, v.params);
+						if (c == null) buf.add(TypeSupport.sanitizeIdent(cf.get().name)); else {
+							var owner = c.c.get();
+							if (owner.isExtern || cf.get().meta.has(":native"))
+								buf.add(TypeSupport.fieldNativeName(cf.get()));
+							else if (isNoThisInlineMethod(owner, cf.get()))
+								buf.add(ensureNoThisInlineMethod(owner, cf.get()));
+							else {
+								var ownerName = addClassType(c.c, c.params);
+								buf.add(ownerName + "_" + TypeSupport.sanitizeIdent(cf.get().name));
+							}
 						}
-						if (owner == null) buf.add(TypeSupport.sanitizeIdent(cf.get()
-							.name)); else if (c != null
-							&& (c.c.get()
-								.isExtern || cf.get()
-								.meta.has(":native"))) buf.add(TypeSupport.fieldNativeName(cf.get())); else buf.add(owner + "_"
-							+ TypeSupport.sanitizeIdent(cf.get().name));
 					case FEnum(enumRef, ef):
 						var enumTypeName = addTypeDef(TypeSupport.defEnum(enumRef.get(), []));
 						var ctorName = enumTypeName + "_" + ef.name;
@@ -791,18 +1025,28 @@ class Transpiler {
 									.isExtern || cf.get()
 									.meta.has(":native")) buf.add(addInline(target) + "." + TypeSupport.fieldNativeName(cf.get()) + "(" + args.join(", ") +
 										")"); else {
-									var className = addClassType(c, params);
-									args.unshift(addInline(target));
-									buf.add((className + "_" + TypeSupport.sanitizeIdent(cf.get().name)) + "(" + args.join(", ") + ")");
+									var owner = c.get();
+									if (isNoThisInlineMethod(owner, cf.get()))
+										buf.add(ensureNoThisInlineMethod(owner, cf.get()) + "(" + args.join(", ") + ")");
+									else if (isNoThisMethod(owner, cf.get())) {
+										var className = addClassType(c, params);
+										buf.add((className + "_" + TypeSupport.sanitizeIdent(cf.get().name)) + "(" + args.join(", ") + ")");
+									} else {
+										var className = addClassType(c, params);
+										args.unshift(addInline(target));
+										buf.add((className + "_" + TypeSupport.sanitizeIdent(cf.get().name)) + "(" + args.join(", ") + ")");
+									}
 								}
 							case FVar(_, _):
+								assertNonLocalVarAccess(cf.get(), c.get(), callee.pos);
 								emitDispatch();
 						}
-					case TField(_, FStatic(_, cf)):
+					case TField(_, FStatic(c, cf)):
 						switch cf.get().kind {
 							case FMethod(_):
 								buf.add(addInline(callee) + "(" + args.join(", ") + ")");
 							case FVar(_, _):
+								assertNonLocalVarAccess(cf.get(), c.get(), callee.pos);
 								emitDispatch();
 						}
 					case TField(_, FEnum(_, _)):
@@ -829,11 +1073,19 @@ class Transpiler {
 					buf.add(" = " + (isFunctionType(v.t) ? functionValueExpr(einit, v.t) : addInline(einit)));
 			case TBlock(el):
 				buf.add("{\n");
+				var localUses = collectLocalUseCounts(el);
 				var terminated = false;
 				for (e in el) {
 					if (terminated)
 						continue;
 					var stmt = unwrapWrapperExpr(e);
+					var skip = switch stmt.expr {
+						case TVar(v, einit): var uses = localUses.get(v.id); (uses == null || uses == 0) && (einit == null || isPureExpr(einit));
+						default:
+							false;
+					}
+					if (skip)
+						continue;
 					emitStatement(stmt, depth + 1);
 					terminated = switch stmt.expr {
 						case TReturn(_), TBreak, TContinue:
@@ -901,52 +1153,53 @@ class Transpiler {
 					default:
 						false;
 				}
+				var switchDepth = makeIdent ? depth : depth + 1;
 				var switchExpr = addInline(e);
 				if (isEnumSwitch)
 					switchExpr += "." + "__tag";
 				buf.add("switch (" + switchExpr + ") {\n");
 				for (c in cases) {
 					for (v in c.values) {
-						indent(depth + 1);
+						indent(switchDepth + 1);
 						var caseValue = isEnumSwitch ? TypeSupport.enumCaseValueIndex(v) : addInline(v);
 						buf.add("case " + caseValue + ":\n");
 					}
-					indent(depth + 1);
+					indent(switchDepth + 1);
 					buf.add("{\n");
 					if (c.expr != null) {
 						var caseExpr = unwrapWrapperExpr(c.expr);
 						switch caseExpr.expr {
 							case TBlock(el):
 								for (stmt in el)
-									emitStatement(stmt, depth + 2);
+									emitStatement(stmt, switchDepth + 2);
 							default:
-								emitStatement(caseExpr, depth + 2);
+								emitStatement(caseExpr, switchDepth + 2);
 						}
 					}
-					indent(depth + 2);
+					indent(switchDepth + 2);
 					buf.add("break;\n");
-					indent(depth + 1);
+					indent(switchDepth + 1);
 					buf.add("}\n");
 				}
 				if (edef != null) {
-					indent(depth + 1);
+					indent(switchDepth + 1);
 					buf.add("default:\n");
-					indent(depth + 1);
+					indent(switchDepth + 1);
 					buf.add("{\n");
 					var defaultExpr = unwrapWrapperExpr(edef);
 					switch defaultExpr.expr {
 						case TBlock(el):
 							for (stmt in el)
-								emitStatement(stmt, depth + 2);
+								emitStatement(stmt, switchDepth + 2);
 						default:
-							emitStatement(defaultExpr, depth + 2);
+							emitStatement(defaultExpr, switchDepth + 2);
 					}
-					indent(depth + 2);
+					indent(switchDepth + 2);
 					buf.add("break;\n");
-					indent(depth + 1);
+					indent(switchDepth + 1);
 					buf.add("}\n");
 				}
-				indent();
+				indent(switchDepth);
 				buf.add("}");
 			case TReturn(e):
 				buf.add("return");

@@ -1,6 +1,6 @@
 package;
 
-import sshader.ShaderSource;
+import sshader.Shader;
 
 enum ShaderMode {
 	Disabled;
@@ -19,6 +19,13 @@ enum StressEnum<T> {
 	SOne(v:T);
 	STwo(a:T, b:T);
 	SMany(seed:Int, payload:T);
+}
+
+enum StressShape<T> {
+	Unit;
+	Pair2(a:T, b:T);
+	Nested(left:StressShape<T>, right:StressShape<T>);
+	Tagged(tag:Int, payload:T);
 }
 
 enum abstract Quality(Int) from Int to Int {
@@ -181,9 +188,7 @@ class ZigIter {
 	}
 
 	public inline function hasNext():Bool
-		return step > 0?current<limit:current>
-
-	limit;
+		return step > 0 ? current < limit : current > limit;
 	public inline function next():Int {
 		var out = current;
 		current += step;
@@ -257,6 +262,106 @@ class StressOps {
 	}
 }
 
+class KeywordProbe {
+	public static function reservedUse(seed:Int):Int {
+		var iin = seed;
+		var out = iin + 1;
+		var uniform = out + 2;
+		var struct = uniform + 3;
+		var flat = struct + 4;
+		var smooth = flat + 5;
+		var gl_Position = smooth + 6;
+		return iin + out + uniform + struct + flat + smooth + gl_Position;
+	}
+}
+
+class ReservedFields {
+	public static var iin:Int = 2;
+	public static var struct:Int = 7;
+	public var uniform:Int;
+
+	public inline function new(v:Int) {
+		this.uniform = v;
+	}
+
+	public function sum(out:Int):Int
+		return this.uniform + out + ReservedFields.iin + ReservedFields.struct;
+}
+
+class FlowLab {
+	public static function reduceShape(s:StressShape<Int>, bias:Int):Int {
+		return switch (s) {
+			case Unit:
+				bias;
+			case Pair2(a, b):
+				a + b + bias;
+			case Tagged(tag, payload):
+				tag * 3 + payload + bias;
+			case Nested(left, right):
+				reduceShape(left, bias + 1) + reduceShape(right, bias + 2);
+		}
+	}
+
+	public static function higher(seed:Int):Int {
+		var base = seed + 3;
+		var inc:Int->Int = function(v:Int):Int return v + base;
+		var mul:Int->Int = function(v:Int):Int return v * 2 + base;
+		var chosen:Int->Int = switch (seed & 3) {
+			case 0:
+				inc;
+			case 1:
+				mul;
+			case 2:
+				DummyCtor.make;
+			default:
+				function(v:Int):Int return v - base;
+		}
+		return chosen(seed) + StressOps.choose(seed, inc, mul, DummyCtor.make)(seed + 1);
+	}
+
+	public static function branchMix(seed:Int, quality:Quality):Int {
+		var iin = seed;
+		var out = 0;
+
+		var arr = [seed, seed + 1, seed + 2, seed + 3];
+		arr[1] += arr[0];
+		arr[2] = arr[1] ^ arr[3];
+		out += arr[2];
+
+		var d = {alpha: arr[0], beta: arr[1], gamma: arr[2]};
+		out += d.alpha + d.beta + d.gamma;
+
+		var ctor = StressShape.Pair2;
+		var made = ctor(seed, seed + quality);
+		out += reduceShape(made, 2);
+		out += seed;
+
+		var pick = switch (iin % 4) {
+			case 0, 1:
+				10;
+			case 2:
+				20;
+			default:
+				30;
+		}
+		out += pick;
+
+		var i = 0;
+		while (i < 4) {
+			out += (i & 1) == 0 ? i : -i;
+			i++;
+		}
+
+		var j = 0;
+		do {
+			out += j;
+			j++;
+		} while (j < 2);
+
+		return out;
+	}
+}
+
 class RectBase {
 	public var baseBias:Int;
 
@@ -300,7 +405,23 @@ class RectLayer extends RectBase {
 		return super.shift(v);
 }
 
-class Tests extends RectLayer implements ShaderSource {
+class Vec2 {
+	public var x:Int;
+	public var y:Int;
+
+	public inline function new(x:Int, y:Int) {
+		this.x = x;
+		this.y = y;
+	}
+}
+
+class Tests extends RectLayer implements Shader {
+	public final offset:Vec2 = new Vec2(2, 3);
+
+	public var time:Float;
+
+	public static var SeedBias:Int;
+
 	public static inline function inlineTwist(v:Int):Int
 		return (v * 3) ^ 5;
 
@@ -429,6 +550,8 @@ class Tests extends RectLayer implements ShaderSource {
 		}
 		outColor += seTag;
 		outColor += tri + zig + stageN;
+		outColor += offset.x + offset.y;
+		outColor += Std.int(this.time) + SeedBias;
 		outColor += p.x + p.y + parity + modeTag + ext + DummyCtor.make(0);
 		outColor += inlineTwist(seed);
 		outColor = inlineClamp(outColor);
@@ -493,6 +616,43 @@ class Tests extends RectLayer implements ShaderSource {
 			d++;
 		} while (d < 2);
 
+		outColor += KeywordProbe.reservedUse(seed);
+		var shape:StressShape<Int> = Nested(Pair2(seed, folded), Tagged(modeTag, outColor));
+		outColor += FlowLab.reduceShape(shape, 3);
+		outColor += FlowLab.branchMix(seed, qualityIn);
+		outColor += FlowLab.higher(seed);
+
+		var rf = new ReservedFields(seed & 7);
+		outColor += rf.sum(modeTag);
+
+		var combo = switch (seed % 5) {
+			case 0, 1:
+				outColor + 1;
+			case 2:
+				outColor - 2;
+			case 3:
+				outColor ^ 7;
+			default:
+				outColor;
+		}
+		outColor = combo;
+
+		var blockValue = {
+			var iin = seed + 1;
+			var out = iin * 2;
+			out + 3;
+		}
+		outColor += blockValue;
+
+		var inc = 0;
+		outColor += ++inc;
+		outColor += inc++;
+		outColor += --inc;
+		outColor += inc--;
+
+		var pickFn = pingFn;
+		outColor += pickFn(seed + 2);
+
 		@:privateAccess outColor += StaticMath.Base;
 		return null;
 	}
@@ -507,6 +667,8 @@ class Tests extends RectLayer implements ShaderSource {
 		var selfPart = this.shift(seed);
 		var superPart = super.shift(seed);
 		mixed += idValue + selfPart + superPart + super.modeWeight(modeB);
+		mixed += offset.x + offset.y;
+		mixed += Std.int(time) + SeedBias;
 		var q:Stage = Stage.C;
 		q = q.next();
 		mixed += cast q;
@@ -585,5 +747,40 @@ class Tests extends RectLayer implements ShaderSource {
 				continue;
 			mixed += z;
 		}
+
+		mixed += KeywordProbe.reservedUse(seed);
+		var shape2:StressShape<Int> = Pair2(mixed, base);
+		mixed += FlowLab.reduceShape(shape2, 1);
+		mixed += FlowLab.branchMix(seed + mixed, qualityIn);
+		mixed += FlowLab.higher(seed + base);
+
+		var rf2 = new ReservedFields(base & 3);
+		mixed += rf2.sum(seed);
+
+		var combo2 = switch ((seed + base) % 4) {
+			case 0, 1:
+				mixed + 1;
+			case 2:
+				mixed - 1;
+			default:
+				mixed ^ 11;
+		}
+		mixed = combo2;
+
+		var tmpBlock = {
+			var iin = mixed;
+			var out = iin + 2;
+			out;
+		}
+		mixed += tmpBlock;
+
+		var pc = 1;
+		mixed += ++pc;
+		mixed += pc++;
+		mixed += --pc;
+		mixed += pc--;
+
+		var chooseFn = function(v:Int):Int return v + base;
+		mixed += chooseFn(seed);
 	}
 }

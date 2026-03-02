@@ -1,17 +1,13 @@
 package sshader;
 
-import haxe.macro.Compiler;
 #if macro
-import haxe.macro.Type;
+import sys.io.File;
 import haxe.macro.Expr;
 import haxe.macro.Context;
-import sshader.transpiler.Types;
 import sshader.transpiler.Transpiler;
 #end
 
-class ShaderSourceBuilder {
-	public static var VERSION = "450";
-
+class ShaderBuilder {
 	#if macro
 	public static function build() {
 		function isShaderSource(field:{name:String, meta:Array<MetadataEntry>}) {
@@ -34,7 +30,7 @@ class ShaderSourceBuilder {
 			if (isShaderSource(field))
 				switch field.kind {
 					case FFun(f):
-                        var e = macro return null;
+						var e = macro return null;
 						f.expr = {
 							expr: switch f.expr.expr {
 								case EBlock(exprs):
@@ -48,15 +44,16 @@ class ShaderSourceBuilder {
 						Context.error(field.name + " must be function", field.pos);
 				}
 
+		var isBuilt = false;
 		Context.onAfterTyping(_ -> {
 			var cls = Context.getLocalClass()?.get();
-			if (cls == null)
+			if (isBuilt || cls == null)
 				return;
 
 			for (field in cls.fields.get())
 				if (isShaderSource({name: field.name, meta: field.meta.get()})) {
-					var src = Transpiler.buildShaderSource(field);
-					trace(src);
+					var src = Transpiler.buildShaderSource(cls, field);
+					File.saveContent(cls.name + "." + field.name + ".glsl", src.toString());
 				}
 		});
 
