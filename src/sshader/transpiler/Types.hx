@@ -16,7 +16,10 @@ typedef EntryPoint = {
 
 typedef TransContext = {
 	locals:Map<Int, String>,
-	usedLocalNames:Map<String, Int>
+	usedLocalNames:Map<String, Int>,
+	?prologue:Array<String>,
+	?uniformLocals:Map<String, String>,
+	?enableUniformLocalAlias:Bool
 }
 
 typedef FunctionDispatcherCase = {

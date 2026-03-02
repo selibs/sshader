@@ -1,7 +1,5 @@
 package sshader;
 
-import sshader.transpiler.Types;
-
 enum AuxInterp {
 	NONE;
 	CENTROID;
@@ -81,20 +79,21 @@ class ShaderSource {
 	}
 
 	public var version:String = "450";
+	public var stage:Null<String> = null;
 	public var uniforms:Array<Uniform> = [];
 	public var varIn:Array<Varying> = [];
 	public var varOut:Array<Varying> = [];
 	public var statics:Array<String> = [];
-	public var body:String = "";
+	public var main:String = "";
 
 	public function new() {}
 
 	public function toString(format:Bool = false) {
 		var buf = new StringBuf();
-
-		function addTypeDef(t:TypeDef) {
-			statics = statics.concat(t.def);
-			return t.name;
+		var preEmitted:Array<String> = [];
+		function addUnique(dst:Array<String>, item:String):Void {
+			if (!dst.contains(item))
+				dst.push(item);
 		}
 
 		function addVarying(v:Varying, d:String) {
@@ -107,24 +106,82 @@ class ShaderSource {
 						case CENTROID: " centroid";
 						case SAMPLE: " sample";
 					}
-				case NOPERSPECTIVE(v):
-					"noperspective" + switch v {
-						case NONE: "";
-						case CENTROID: " centroid";
-						case SAMPLE: " sample";
-					}
+					case NOPERSPECTIVE(v):
+						"noperspective" + switch v {
+							case NONE: "";
+							case CENTROID: " centroid";
+							case SAMPLE: " sample";
+						}
+				}
+			var allowInterp = switch stage {
+				case "vert":
+					d == "out";
+				case "frag":
+					d == "in";
+				default:
+					true;
 			}
-			buf.add('layout(location = ${v.location}) $interp $d ${addTypeDef(v.type)} ${v.name};\n');
+			var prefix = allowInterp ? (interp + " ") : "";
+			buf.add('layout(location = ${v.location}) $prefix$d ${v.type.name} ${v.name};\n');
+		}
+
+		function definesType(def:String, typeName:String):Bool {
+			var s = StringTools.ltrim(def);
+			return StringTools.startsWith(s, "struct " + typeName + " {") || StringTools.startsWith(s, "#define " + typeName + " ");
+		}
+
+		function hasTypeDef(defs:Array<String>, typeName:String):Bool {
+			for (d in defs)
+				if (definesType(d, typeName))
+					return true;
+			return false;
+		}
+
+		function findTypeDefInStatics(typeName:String):Null<String> {
+			for (s in statics)
+				if (definesType(s, typeName))
+					return s;
+			return null;
+		}
+		function collectTypeDef(types:Array<String>, typeNames:Array<String>, t:TypeDef):Void {
+			addUnique(typeNames, t.name);
+			for (d in t.def)
+				addUnique(types, d);
 		}
 
 		// version
 		if (version != null)
 			buf.add('#version $version\n\n');
 
+		var headerTypes:Array<String> = [];
+		var headerTypeNames:Array<String> = [];
+		for (u in uniforms)
+			collectTypeDef(headerTypes, headerTypeNames, u.type);
+		for (v in varIn)
+			collectTypeDef(headerTypes, headerTypeNames, v.type);
+		for (v in varOut)
+			collectTypeDef(headerTypes, headerTypeNames, v.type);
+		for (typeName in headerTypeNames)
+			if (!hasTypeDef(headerTypes, typeName)) {
+				var lifted = findTypeDefInStatics(typeName);
+				if (lifted != null)
+					addUnique(headerTypes, lifted);
+			}
+		for (d in headerTypes) {
+			buf.add(d + "\n");
+			preEmitted.push(d);
+		}
+		if (headerTypes.length > 0)
+			buf.add("\n");
+
 		// uniforms
 		if (uniforms.length > 0) {
+			buf.add("layout(set = 0, binding = 0) uniform shader_uniform_block {\n");
 			for (u in uniforms)
-				buf.add('uniform ${addTypeDef(u.type)} ${u.name};\n');
+				buf.add('\t${u.type.name} ${u.name};\n');
+			buf.add("} shader_uniforms;\n");
+			for (u in uniforms)
+				buf.add('#define ${u.name} shader_uniforms.${u.name}\n');
 			buf.add("\n");
 		}
 
@@ -145,6 +202,8 @@ class ShaderSource {
 		// statics
 		var unique = [];
 		for (s in statics) {
+			if (preEmitted.contains(s))
+				continue;
 			if (unique.contains(s))
 				continue;
 			buf.add(s + "\n");
@@ -152,9 +211,9 @@ class ShaderSource {
 		}
 
 		// body
-		if (body.length > 0) {
+		if (main.length > 0) {
 			buf.add("void main() ");
-			buf.add(body);
+			buf.add(main);
 			buf.add("\n");
 		}
 

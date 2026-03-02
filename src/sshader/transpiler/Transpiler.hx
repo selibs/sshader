@@ -12,37 +12,57 @@ using haxe.macro.ComplexTypeTools;
 using haxe.macro.TypedExprTools;
 
 class Transpiler {
+	public static inline function wrapFunctionBody(bodyExpr:String):String {
+		return bodyExpr.length > 0 && bodyExpr.charAt(0) == "{" ? bodyExpr : "{" + bodyExpr + ";}";
+	}
+
+	static inline function isVertEntryName(name:String):Bool {
+		return name == "vert" || name == "_vert_";
+	}
+
+	static inline function isFragEntryName(name:String):Bool {
+		return name == "frag" || name == "_frag_";
+	}
+
 	public static function buildShaderSource(owner:ClassType, field:ClassField):ShaderSource {
 		switch field.expr().expr {
 			case TFunction(tfunc):
-				var prevEntryTypes = TypeSupport.curDefinedTypes;
-				var prevDispatchers = TypeSupport.curDispatchers;
-				var prevDispatcherSeq = TypeSupport.curDispatcherSeq;
-				var prevHelperSeq = TypeSupport.curHelperSeq;
-				var prevUniformFields = TypeSupport.curUniformFields;
-				var prevInlineNoThisMethods = TypeSupport.curInlineNoThisMethods;
-				TypeSupport.curDefinedTypes = new Map();
-				TypeSupport.curDispatchers = new Map();
-				TypeSupport.curDispatcherSeq = 0;
-				TypeSupport.curHelperSeq = 0;
-				TypeSupport.curInlineNoThisMethods = new Map();
-
-				var p = Transpiler.entryPoint(tfunc, field.pos);
-
-				var s = new ShaderSource();
-				s.uniforms = TypeSupport.collectUniforms(owner, true);
+				var snapshot = TypeSupport.beginEntryContext(owner);
+				TypeSupport.collectUsageFromExpr(tfunc.expr);
+					var linkedVertOut:Null<Array<{
+						name:String,
+						location:Int,
+						typeSig:String,
+						typeName:String,
+						interp:VaryingInterp
+					}>> = null;
+				if (isFragEntryName(field.name)) {
+					var vertField:Null<ClassField> = null;
+					for (f in owner.fields.get())
+						if (isVertEntryName(f.name)) {
+							vertField = f;
+							break;
+						}
+					if (vertField != null) {
+						var expr = vertField.expr();
+						if (expr != null)
+							switch expr.expr {
+								case TFunction(vfunc):
+									linkedVertOut = collectVaryingLayoutFromReturn(vfunc.t, vertField.pos);
+								default:
+									Context.error('Vertex entry point "vert" should be function', vertField.pos);
+							}
+					}
+				}
+				var p = Transpiler.entryPoint(owner, tfunc, field.pos, isFragEntryName(field.name), linkedVertOut);
+					var s = new ShaderSource();
+					s.stage = isFragEntryName(field.name) ? "frag" : "vert";
+					s.uniforms = TypeSupport.usedUniforms();
 				s.varIn = p.varIn;
 				s.varOut = p.varOut;
 				s.statics = p.body.statics;
-				s.body = p.body.expr;
-
-				TypeSupport.curDefinedTypes = prevEntryTypes;
-				TypeSupport.curDispatchers = prevDispatchers;
-				TypeSupport.curDispatcherSeq = prevDispatcherSeq;
-				TypeSupport.curHelperSeq = prevHelperSeq;
-				TypeSupport.curUniformFields = prevUniformFields;
-				TypeSupport.curInlineNoThisMethods = prevInlineNoThisMethods;
-
+				s.main = p.body.expr;
+				TypeSupport.endEntryContext(snapshot);
 				return s;
 			default:
 				Context.error("Shader entry point should be function", field.pos);
@@ -50,115 +70,313 @@ class Transpiler {
 		}
 	}
 
-	public static function entryPoint(func:TFunc, pos:Position):EntryPoint {
-		function parseVarying(args:Array<{name:String, type:TypeDef, meta:MetaAccess}>) {
-			var varyings = [];
-			for (i in 0...args.length) {
-				var a = args[i];
-				var name = a.name;
-				var type = a.type;
-				var meta = a.meta;
-
-				function getParam(p:String, d:Expr) {
-					if (!meta.has(p))
-						return d;
-					var m = meta.extract(p)[0];
-					var params = m.params;
-					if (params == null || params.length == 0) {
-						Context.warning("Value expected", m.pos);
-						return d;
-					}
-					if (params.length > 1) {
-						Context.warning("Too much values", m.pos);
-						return d;
-					}
-					return m.params[0];
-				}
-
-				function getInterp(q:String) {
-					var aux = getParam(q, macro none);
-					return switch aux.expr {
-						case EConst(CIdent(s)):
-							switch s {
-								case "none":
-									NONE;
-								case "sample":
-									SAMPLE;
-								case "centroid":
-									CENTROID;
-								default:
-									Context.warning("Invalid auxiliary qualifier", aux.pos);
-									NONE;
-							}
+	static function parseLocation(meta:MetaAccess, i:Int):Int {
+		if (!meta.has("location"))
+			return i;
+		var m = meta.extract("location")[0];
+		var params = m.params;
+		if (params == null || params.length == 0) {
+			Context.warning("Value expected", m.pos);
+			return i;
+		}
+		if (params.length > 1) {
+			Context.warning("Too much values", m.pos);
+			return i;
+		}
+		return switch params[0].expr {
+			case EConst(CInt(s)):
+				var l = Std.parseInt(s);
+				if (l == null) {
+					Context.warning("Invalid location", params[0].pos);
+					i;
+				} else l;
+			default:
+				Context.warning("Invalid location", params[0].pos);
+				i;
+		}
+	}
+	static function parseInterp(meta:MetaAccess):VaryingInterp {
+		function getParam(p:String, d:Expr) {
+			if (!meta.has(p))
+				return d;
+			var m = meta.extract(p)[0];
+			var params = m.params;
+			if (params == null || params.length == 0) {
+				Context.warning("Value expected", m.pos);
+				return d;
+			}
+			if (params.length > 1) {
+				Context.warning("Too much values", m.pos);
+				return d;
+			}
+			return m.params[0];
+		}
+		function getInterp(q:String) {
+			var aux = getParam(q, macro none);
+			return switch aux.expr {
+				case EConst(CIdent(s)):
+					switch s {
+						case "none":
+							NONE;
+						case "sample":
+							SAMPLE;
+						case "centroid":
+							CENTROID;
 						default:
 							Context.warning("Invalid auxiliary qualifier", aux.pos);
 							NONE;
 					}
-				}
-
-				varyings.push({
-					name: name,
-					type: type,
-					interp: {
-						if (meta.has("flat"))
-							FLAT;
-						else if (meta.has("smooth"))
-							SMOOTH(getInterp("smooth"));
-						else if (meta.has("noperspective"))
-							NOPERSPECTIVE(getInterp("noperspective"));
-						else
-							SMOOTH(NONE);
-					},
-					location: {
-						var loc = getParam("location", macro $v{i});
-						switch loc.expr {
-							case EConst(CInt(s)):
-								var l = Std.parseInt(s);
-								if (l == null) {
-									l = i;
-									Context.warning("Invalid location", loc.pos);
-								}
-								l;
-							default:
-								Context.warning("Invalid location", loc.pos);
-								i;
-						}
-					}
-				});
+				default:
+					Context.warning("Invalid auxiliary qualifier", aux.pos);
+					NONE;
 			}
+		}
+		return if (meta.has("flat"))
+			FLAT;
+		else if (meta.has("smooth"))
+			SMOOTH(getInterp("smooth"));
+		else if (meta.has("noperspective"))
+			NOPERSPECTIVE(getInterp("noperspective"));
+		else
+			SMOOTH(NONE);
+	}
+	static inline function hasInterpMeta(meta:MetaAccess):Bool {
+		return meta.has("flat") || meta.has("smooth") || meta.has("noperspective");
+	}
+
+	static function collectVaryingLayoutFromReturn(type:Type, pos:Position):Array<{
+		name:String,
+		location:Int,
+		typeSig:String,
+		typeName:String,
+		interp:VaryingInterp
+	}> {
+		var fields = switch type {
+			case TAnonymous(a):
+				a.get().fields;
+			case TType(t, _):
+				return collectVaryingLayoutFromReturn(t.get().type, pos);
+			default:
+				Context.error("Invalid return type", pos);
+				[];
+		}
+		var out:Array<{
+			name:String,
+			location:Int,
+			typeSig:String,
+			typeName:String,
+			interp:VaryingInterp
+		}> = [];
+		for (i in 0...fields.length) {
+			var f = fields[i];
+			var typeDef = TypeSupport.defType(f.type, f.pos);
+			out.push({
+				name: TypeSupport.sanitizeIdent(f.name),
+				location: parseLocation(f.meta, i),
+				typeSig: Context.signature(f.type.follow()),
+				typeName: typeDef.name,
+				interp: parseInterp(f.meta)
+			});
+		}
+		return out;
+	}
+
+	public static function entryPoint(owner:ClassType, func:TFunc, pos:Position, isFrag:Bool = false, vertOutLayout:Null<Array<{
+		name:String,
+		location:Int,
+		typeSig:String,
+		typeName:String,
+		interp:VaryingInterp
+	}>> = null):EntryPoint {
+		function parseVarying(args:Array<{
+			name:String,
+			type:TypeDef,
+			typeSig:String,
+			meta:MetaAccess,
+			pos:Position
+		}>, forFragInput:Bool, kind:String) {
+			inline function isInterfaceTypeName(name:String):Bool {
+				return switch name {
+					case "bool", "int", "uint", "float", "double", "bvec2", "bvec3", "bvec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3", "uvec4",
+						"vec2", "vec3", "vec4", "dvec2", "dvec3", "dvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3",
+						"mat3x4", "mat4x2", "mat4x3", "mat4x4", "dmat2", "dmat3", "dmat4", "dmat2x2", "dmat2x3", "dmat2x4", "dmat3x2", "dmat3x3",
+						"dmat3x4", "dmat4x2", "dmat4x3", "dmat4x4":
+						true;
+					default:
+						false;
+				}
+			}
+			var varyings = [];
+			var vertOutByName = new Map<String, Int>();
+				var vertOutByLocation = new Map<Int, {name:String, typeSig:String, typeName:String, interp:VaryingInterp}>();
+			var usedLocationNames = new Map<Int, String>();
+			if (forFragInput && vertOutLayout != null)
+				for (v in vertOutLayout) {
+					if (!vertOutByName.exists(v.name))
+						vertOutByName.set(v.name, v.location);
+						vertOutByLocation.set(v.location, {
+							name: v.name,
+							typeSig: v.typeSig,
+							typeName: v.typeName,
+							interp: v.interp
+						});
+					}
+				for (i in 0...args.length) {
+					var a = args[i];
+					var name = TypeSupport.sanitizeIdent(a.name);
+					var type = a.type;
+					var argPos = a.pos;
+					if (!isInterfaceTypeName(type.name))
+						Context.error('Unsupported GLSL interface type "${type.name}" for $kind varying "$name". Use scalar/vector/matrix types.', argPos);
+					var typeSig = a.typeSig;
+					var meta = a.meta;
+					var location = if (forFragInput) {
+					if (meta.has("location")) {
+						var l = parseLocation(meta, i);
+						if (!vertOutByLocation.exists(l))
+							Context.error('No vertex output varying with location $l was found.', argPos);
+						l;
+					} else {
+						var l = vertOutByName.get(name);
+						if (l == null)
+							Context.error('No vertex output varying with name "$name" was found.', argPos);
+						l;
+					}
+				} else parseLocation(meta, i);
+				var prevAtLocation = usedLocationNames.get(location);
+				if (prevAtLocation != null)
+					Context.error('Duplicate $kind varying location $location for "$name" and "$prevAtLocation".', argPos);
+				usedLocationNames.set(location, name);
+				if (forFragInput) {
+						var vert = vertOutByLocation.get(location);
+						if (vert != null && vert.typeSig != typeSig)
+							Context.error('Type mismatch at location $location: fragment input "$name" (${type.name}) is incompatible with vertex output "${vert.name}" (${vert.typeName}).',
+								argPos);
+					}
+					var interp = parseInterp(meta);
+					if (forFragInput && !hasInterpMeta(meta)) {
+						var vert = vertOutByLocation.get(location);
+						if (vert != null)
+							interp = vert.interp;
+					}
+					varyings.push({
+						name: name,
+						type: type,
+						interp: interp,
+						location: location
+					});
+				}
 			return varyings;
 		}
-
+		function uniquifyInterfaceNames(varIn:Array<Varying>, varOut:Array<Varying>):Void {
+			var usedOut = new Map<String, Bool>();
+			for (v in varOut)
+				usedOut.set(v.name, true);
+			var usedAll = new Map<String, Bool>();
+			for (v in varOut)
+				usedAll.set(v.name, true);
+			function nextName(base:String):String {
+				var candidate = base + "_in";
+				var i = 1;
+				while (usedAll.exists(candidate)) {
+					candidate = base + "_in_" + i;
+					i++;
+				}
+				return candidate;
+			}
+			for (v in varIn) {
+				var current = v.name;
+				if (usedOut.exists(current))
+					current = nextName(current);
+				while (usedAll.exists(current))
+					current = nextName(current);
+				v.name = current;
+				usedAll.set(current, true);
+			}
+		}
 		function getVarOut(type:Type) {
 			return switch type {
 				case TAnonymous(a):
 					parseVarying(a.get().fields.map(f -> {
 						name: f.name,
 						type: TypeSupport.defType(f.type, f.pos),
-						meta: f.meta
-					}));
+						typeSig: Context.signature(f.type.follow()),
+						meta: f.meta,
+						pos: f.pos
+					}), false, "output");
 				case TType(t, _):
 					getVarOut(t.get().type);
 				default:
 					Context.error("Invalid return type", pos);
 			}
 		}
-
-		var ep = {
-			varIn: parseVarying(func.args.map(a -> {
-				name: a.v.name,
-				type: TypeSupport.defType(a.v.t, pos),
-				meta: a.v.meta
-			})),
-			varOut: getVarOut(func.t),
-			body: transExpr(func.expr)
+		function prependPrologue(body:String, prologue:Array<String>):String {
+			if (prologue == null || prologue.length == 0)
+				return body;
+			var pref = new StringBuf();
+			for (line in prologue)
+				pref.add(line + ";");
+			if (body.length > 0 && body.charAt(0) == "{")
+				return "{" + pref.toString() + body.substr(1);
+			return "{" + pref.toString() + body + ";}";
+		}
+		if (isFrag && func.args.length > 0 && vertOutLayout == null)
+			Context.error('Fragment entry point requires vertex entry point "vert" with output varyings.', pos);
+		var argEntries = func.args.map(a -> ({
+			id: a.v.id,
+			name: a.v.name,
+			type: TypeSupport.defType(a.v.t, pos),
+			typeSig: Context.signature(a.v.t.follow()),
+			meta: a.v.meta,
+			pos: pos
+		}));
+			var varIn = parseVarying(argEntries.map(a -> ({
+				name: a.name,
+				type: a.type,
+				typeSig: a.typeSig,
+				meta: a.meta,
+				pos: a.pos
+			})), isFrag, "input");
+			var varOut = getVarOut(func.t);
+			uniquifyInterfaceNames(varIn, varOut);
+			var ctx:TransContext = {
+				locals: new Map(),
+				usedLocalNames: new Map(),
+				prologue: [],
+				uniformLocals: new Map(),
+			enableUniformLocalAlias: true
+		};
+		for (v in varIn)
+			ctx.usedLocalNames.set(TypeSupport.sanitizeIdent(v.name), 1);
+		for (uniformName in TypeSupport.uniformCandidateNames(owner))
+			ctx.usedLocalNames.set(uniformName, 1);
+		for (i in 0...argEntries.length) {
+			var arg = argEntries[i];
+			var local = TypeSupport.reserveLocalName(ctx.usedLocalNames, arg.name, "_tmp");
+			ctx.locals.set(arg.id, local);
+			ctx.prologue.push(varIn[i].type.name + " " + local + " = " + varIn[i].name);
+		}
+			var body = transExpr(func.expr, ctx);
+			var mergedStatics = body.statics.copy();
+			var dispatcherDecls = buildDispatcherDecls();
+			var declInsertAt = dispatcherDeclInsertIndex(mergedStatics);
+			for (i in 0...dispatcherDecls.length)
+				mergedStatics.insert(declInsertAt + i, dispatcherDecls[i]);
+			var dispatchers = buildDispatchers();
+			for (d in dispatchers)
+				mergedStatics.push(d);
+			var ep = {
+				varIn: varIn,
+				varOut: varOut,
+				body: {
+					statics: mergedStatics,
+					expr: prependPrologue(body.expr, ctx.prologue)
+				}
+			}
+			return ep;
 		}
 
-		return ep;
-	}
-
-	public static function transExpr(expr:TypedExpr, endLine:Bool = false, breakLine:Bool = false, depth:Int = 0, makeIdent = true,
-			ctx:TransContext = null):EntryPointBody {
+	public static function transExpr(expr:TypedExpr, ctx:TransContext = null, isInlineContext:Bool = false):EntryPointBody {
 		if (ctx == null)
 			ctx = {
 				locals: new Map(),
@@ -166,20 +384,21 @@ class Transpiler {
 			};
 		final statics = [];
 		final buf = new StringBuf();
-		function indent(?d:Int)
-			for (_ in 0...(d ?? depth))
-				buf.add("\t");
-		function addExpr(expr:TypedExpr, endLine:Bool = false, breakLine:Bool = false, depth:Int = 0, makeIdent = true) {
-			var body = transExpr(expr, endLine, breakLine, depth, makeIdent, ctx);
-			for (s in body.statics)
+		inline function appendStatics(items:Array<String>) {
+			if (items == null)
+				return;
+			for (s in items)
 				statics.push(s);
+		}
+		function addExpr(expr:TypedExpr, isInlineContext:Bool = false) {
+			var body = transExpr(expr, ctx, isInlineContext);
+			appendStatics(body.statics);
 			return body.expr;
 		}
 		function addInline(expr:TypedExpr)
-			return addExpr(expr, false, false, 0, false);
+			return addExpr(expr, true);
 		function addTypeDef(type:TypeDef) {
-			for (s in type.def)
-				statics.push(s);
+			appendStatics(type.def);
 			return type.name;
 		}
 		function addType(t:Type)
@@ -197,7 +416,7 @@ class Transpiler {
 			}
 		}
 		function assertNonLocalVarAccess(field:ClassField, owner:ClassType, p:Position) {
-			if (TypeSupport.uniformNameForField(owner, field) != null || field.isFinal)
+			if (TypeSupport.useUniformField(owner, field) != null || field.isFinal)
 				return;
 			if (TypeSupport.isShaderSourceClass(owner))
 				Context.error('Non-local mutable field "${owner.name}.${field.name}" is not allowed in shader code.', p);
@@ -223,15 +442,13 @@ class Transpiler {
 			var existing = TypeSupport.curInlineNoThisMethods.get(helperKey);
 			if (existing != null)
 				return existing;
-			var helperName = TypeSupport.sanitizeIdent(TypeSupport.classBaseName(owner) + "_" + field.name + "__inline_nothis");
+			var helperName = TypeSupport.sanitizeIdent(TypeSupport.classBaseName(owner) + "_" + field.name + "_inline_nothis");
 			TypeSupport.curInlineNoThisMethods.set(helperKey, helperName);
 			function helperTypeName(t:Type, p:Position):String {
 				var td = TypeSupport.defType(t, p);
-				for (s in td.def)
-					statics.push(s);
+				appendStatics(td.def);
 				return td.name;
 			}
-
 			var signature = switch field.type.follow() {
 				case TFun(args, ret):
 					{
@@ -250,30 +467,11 @@ class Transpiler {
 				locals: new Map(),
 				usedLocalNames: new Map()
 			};
-			function reserveArgName(raw:String):String {
-				var base = TypeSupport.sanitizeIdent(raw);
-				if (base == "_" || base == "this" || base == "__self")
-					base = "__arg";
-				var count = methodCtx.usedLocalNames.get(base);
-				if (count == null) {
-					methodCtx.usedLocalNames.set(base, 1);
-					return base;
-				}
-				var name = base + "_" + count;
-				var i = count + 1;
-				while (methodCtx.usedLocalNames.exists(name)) {
-					name = base + "_" + i;
-					i++;
-				}
-				methodCtx.usedLocalNames.set(base, i);
-				methodCtx.usedLocalNames.set(name, 1);
-				return name;
-			}
 			var argsDecl = [];
 			var argNames:Array<String> = [];
 			for (arg in signature.args) {
 				var argType = helperTypeName(arg.t, field.pos);
-				var argName = reserveArgName(arg.name);
+				var argName = TypeSupport.reserveLocalName(methodCtx.usedLocalNames, arg.name, "_arg");
 				argNames.push(argName);
 				argsDecl.push(argType + " " + argName);
 			}
@@ -321,26 +519,21 @@ class Transpiler {
 			var bodyExpr = methodFunc != null ? methodFunc.expr : methodExpr;
 			var inlineValueExpr = extractInlineValue(bodyExpr);
 			if (inlineValueExpr != null) {
-				var inlined = transExpr(inlineValueExpr, false, false, 0, false, methodCtx);
-				for (s in inlined.statics)
-					statics.push(s);
+				var inlined = transExpr(inlineValueExpr, methodCtx);
+				appendStatics(inlined.statics);
 				statics.push("#define " + helperName + "(" + argNames.join(", ") + ") (" + inlined.expr + ")");
 				return helperName;
 			}
 			var body = switch methodExpr.expr {
 				case TFunction(func):
-					transExpr(func.expr, false, false, 0, false, methodCtx);
+					transExpr(func.expr, methodCtx);
 				default:
-					transExpr(methodExpr, false, false, 0, false, methodCtx);
+					transExpr(methodExpr, methodCtx);
 			}
-			for (s in body.statics)
-				statics.push(s);
+			appendStatics(body.statics);
 			var b = new StringBuf();
 			b.add(retType + " " + helperName + "(" + argsDecl.join(", ") + ") ");
-			if (body.expr.length > 0 && body.expr.charAt(0) == "{")
-				b.add(body.expr + "\n");
-			else
-				b.add("{\n\t" + body.expr + ";\n}\n");
+			b.add(wrapFunctionBody(body.expr));
 			statics.push(b.toString());
 			return helperName;
 		}
@@ -356,13 +549,11 @@ class Transpiler {
 			return switch t.follow() {
 				case TFun(args, ret):
 					var retDef = TypeSupport.defType(ret, expr.pos);
-					for (s in retDef.def)
-						statics.push(s);
+					appendStatics(retDef.def);
 					var argDefs = [];
 					for (a in args) {
 						var d = TypeSupport.defType(a.t, expr.pos);
-						for (s in d.def)
-							statics.push(s);
+						appendStatics(d.def);
 						argDefs.push(d.name);
 					}
 					{
@@ -400,31 +591,29 @@ class Transpiler {
 					true;
 			}
 		}
-		function reserveLocalName(raw:String):String {
-			var base = TypeSupport.sanitizeIdent(raw);
-			if (base == "_" || base == "this" || base == "__self")
-				base = "__tmp";
-			var count = ctx.usedLocalNames.get(base);
-			if (count == null) {
-				ctx.usedLocalNames.set(base, 1);
-				return base;
-			}
-			var name = base + "_" + count;
-			var i = count + 1;
-			while (ctx.usedLocalNames.exists(name)) {
-				name = base + "_" + i;
-				i++;
-			}
-			ctx.usedLocalNames.set(base, i);
-			ctx.usedLocalNames.set(name, 1);
-			return name;
-		}
 		function localName(v:TVar):String {
 			if (ctx.locals.exists(v.id))
 				return ctx.locals.get(v.id);
-			var name = reserveLocalName(v.name);
+			var name = TypeSupport.reserveLocalName(ctx.usedLocalNames, v.name, "_tmp");
 			ctx.locals.set(v.id, name);
 			return name;
+		}
+		function ensureUniformLocal(owner:ClassType, field:ClassField, uniformName:String, fieldType:Type):String {
+			if (ctx.enableUniformLocalAlias != true)
+				return uniformName;
+			if (ctx.uniformLocals == null)
+				ctx.uniformLocals = new Map();
+			var key = TypeSupport.uniformFieldKey(owner, field);
+			var existing = ctx.uniformLocals.get(key);
+			if (existing != null)
+				return existing;
+			var local = TypeSupport.reserveLocalName(ctx.usedLocalNames, field.name, "_tmp");
+			var typeName = addType(fieldType);
+			if (ctx.prologue == null)
+				ctx.prologue = [];
+			ctx.prologue.push(typeName + " " + local + " = " + uniformName);
+			ctx.uniformLocals.set(key, local);
+			return local;
 		}
 		function canInlineValueExpr(e:TypedExpr):Bool {
 			var v = unwrapWrapperExpr(e);
@@ -544,8 +733,7 @@ class Transpiler {
 		}
 		function typeNameOfExprType(t:Type, p:Position):String {
 			var td = TypeSupport.defType(t, p);
-			for (s in td.def)
-				statics.push(s);
+			appendStatics(td.def);
 			return td.name;
 		}
 		function makeFunctionCase(retType:String, argTypes:Array<String>, target:String, captures:Array<{t:Type, expr:String}>, p:Position):String {
@@ -563,20 +751,20 @@ class Transpiler {
 		}
 		function buildBoundMethodWrapper(name:String, retType:String, fieldName:String, selfType:String, argTypes:Array<String>, isExtern:Bool):String {
 			var b = new StringBuf();
-			var argsDecl = [selfType + " __self_cap"];
+			var argsDecl = [selfType + " _self_cap"];
 			var argsCall = [];
 			for (i in 0...argTypes.length) {
-				argsDecl.push(argTypes[i] + " __a" + i);
-				argsCall.push("__a" + i);
+				argsDecl.push(argTypes[i] + " _a" + i);
+				argsCall.push("_a" + i);
 			}
-			b.add(retType + " " + name + "(" + argsDecl.join(", ") + ") {\n");
-			var call = isExtern ? ("__self_cap." + fieldName + "(" + argsCall.join(", ") + ")") : (fieldName + "(__self_cap"
+			b.add(retType + " " + name + "(" + argsDecl.join(", ") + "){");
+			var call = isExtern ? ("_self_cap." + fieldName + "(" + argsCall.join(", ") + ")") : (fieldName + "(_self_cap"
 				+ (argsCall.length > 0 ? ", " + argsCall.join(", ") : "") + ")");
 			if (retType == "Void" || retType == "void")
-				b.add("\t" + call + ";\n\treturn;\n");
+				b.add(call + ";return;");
 			else
-				b.add("\treturn " + call + ";\n");
-			b.add("}\n");
+				b.add("return " + call + ";");
+			b.add("}");
 			return b.toString();
 		}
 		function lowerLambdaFunction(func:TFunc, sigType:Type, p:Position):{target:String, captures:Array<{t:Type, expr:String}>} {
@@ -602,7 +790,7 @@ class Transpiler {
 				Context.error("this/super captures in lambda function values are not supported in GLSL", p);
 			var captures = [for (v in capById) v];
 			captures.sort((a, b) -> a.id - b.id);
-			var lambdaName = nextHelperName("__fn_lambda_");
+			var lambdaName = nextHelperName("_fn_lambda_");
 			var argsDecl = [];
 			var capExprs:Array<{t:Type, expr:String}> = [];
 			var lambdaCtx:TransContext = {
@@ -612,7 +800,7 @@ class Transpiler {
 			for (i in 0...captures.length) {
 				var v = captures[i];
 				var tname = typeNameOfExprType(v.t, p);
-				var aname = "__cap" + i;
+				var aname = "_cap" + i;
 				argsDecl.push(tname + " " + aname);
 				lambdaCtx.locals.set(v.id, aname);
 				lambdaCtx.usedLocalNames.set(aname, 1);
@@ -622,22 +810,18 @@ class Transpiler {
 			for (i in 0...parts.args.length) {
 				var a = parts.args[i];
 				var tname = typeNameOfExprType(a.t, p);
-				var aname = "__a" + i;
+				var aname = "_a" + i;
 				argsDecl.push(tname + " " + aname);
 				if (i < func.args.length)
 					lambdaCtx.locals.set(func.args[i].v.id, aname);
 				lambdaCtx.usedLocalNames.set(aname, 1);
 			}
 			var retType = typeNameOfExprType(parts.ret, p);
-			var body = transExpr(func.expr, false, false, 0, false, lambdaCtx);
-			for (s in body.statics)
-				statics.push(s);
+			var body = transExpr(func.expr, lambdaCtx);
+			appendStatics(body.statics);
 			var b = new StringBuf();
 			b.add(retType + " " + lambdaName + "(" + argsDecl.join(", ") + ") ");
-			if (body.expr.length > 0 && body.expr.charAt(0) == "{")
-				b.add(body.expr + "\n");
-			else
-				b.add("{\n\t" + body.expr + ";\n}\n");
+			b.add(wrapFunctionBody(body.expr));
 			statics.push(b.toString());
 			return {
 				target: lambdaName,
@@ -655,18 +839,19 @@ class Transpiler {
 				case TFunction(func):
 					lowerLambdaFunction(func, sigType, u.pos);
 				case TField(_, FStatic(c, cf)):
+					TypeSupport.markClassFieldUsed(c.get(), cf.get(), true);
 					if (isVarField(cf.get()))
 						assertNonLocalVarAccess(cf.get(), c.get(), u.pos);
 					if (c.get().isExtern || cf.get().meta.has(":native")) {
 						target: TypeSupport.fieldNativeName(cf.get()),
 						captures: []
-					} else {
-						var className = addClassType(c, []);
-						{
-							target: className + "_" + TypeSupport.sanitizeIdent(cf.get().name),
-							captures: []
-						};
-					}
+						} else {
+							var className = addClassType(c, []);
+							{
+								target: TypeSupport.memberSymbol(className, cf.get().name),
+								captures: []
+							};
+						}
 				case TField(_, FEnum(enumRef, ef)):
 					var enumTypeName = addTypeDef(TypeSupport.defEnum(enumRef.get(), []));
 					{
@@ -674,12 +859,13 @@ class Transpiler {
 						captures: []
 					};
 				case TField(target, FInstance(c, params, cf)):
+					TypeSupport.markClassFieldUsed(c.get(), cf.get(), false);
 					if (isVarField(cf.get()))
 						assertNonLocalVarAccess(cf.get(), c.get(), u.pos);
 					var owner = c.get();
 					if (owner.isExtern || cf.get().meta.has(":native")) {
 						var selfType = typeNameOfExprType(target.t, target.pos);
-						var helperName = nextHelperName("__fn_bound_");
+						var helperName = nextHelperName("_fn_bound_");
 						statics.push(buildBoundMethodWrapper(helperName, retType, TypeSupport.fieldNativeName(cf.get()), selfType, argTypes, true));
 						{
 							target: helperName,
@@ -690,32 +876,32 @@ class Transpiler {
 							target: ensureNoThisInlineMethod(owner, cf.get()),
 							captures: []
 						};
-					} else if (isNoThisMethod(owner, cf.get())) {
-						var className = addClassType(c, params);
-						{
-							target: className + "_" + TypeSupport.sanitizeIdent(cf.get().name),
-							captures: []
-						};
-					} else {
-						var className = addClassType(c, params);
-						{
-							target: className + "_" + TypeSupport.sanitizeIdent(cf.get().name),
-							captures: [{t: target.t, expr: addInline(target)}]
-						};
-					}
+						} else if (isNoThisMethod(owner, cf.get())) {
+							var className = addClassType(c, params);
+							{
+								target: TypeSupport.memberSymbol(className, cf.get().name),
+								captures: []
+							};
+						} else {
+							var className = addClassType(c, params);
+							{
+								target: TypeSupport.memberSymbol(className, cf.get().name),
+								captures: [{t: target.t, expr: addInline(target)}]
+							};
+						}
 				case TField(target, FClosure(c, cf)):
 					switch c {
 						case null:
 							Context.error("Unsupported function value", u.pos);
 							{
-								target: "__invalid_fn",
+								target: "_invalid_fn",
 								captures: []
 							};
 						case cc:
 							var owner = cc.c.get();
 							if (owner.isExtern || cf.get().meta.has(":native")) {
 								var selfType = typeNameOfExprType(target.t, target.pos);
-								var helperName = nextHelperName("__fn_bound_");
+								var helperName = nextHelperName("_fn_bound_");
 								statics.push(buildBoundMethodWrapper(helperName, retType, TypeSupport.fieldNativeName(cf.get()), selfType, argTypes, true));
 								{
 									target: helperName,
@@ -726,24 +912,24 @@ class Transpiler {
 									target: ensureNoThisInlineMethod(owner, cf.get()),
 									captures: []
 								};
-							} else if (isNoThisMethod(owner, cf.get())) {
-								var className = addClassType(cc.c, cc.params);
-								{
-									target: className + "_" + TypeSupport.sanitizeIdent(cf.get().name),
-									captures: []
-								};
-							} else {
-								var className = addClassType(cc.c, cc.params);
-								{
-									target: className + "_" + TypeSupport.sanitizeIdent(cf.get().name),
-									captures: [{t: target.t, expr: addInline(target)}]
-								};
-							}
+								} else if (isNoThisMethod(owner, cf.get())) {
+									var className = addClassType(cc.c, cc.params);
+									{
+										target: TypeSupport.memberSymbol(className, cf.get().name),
+										captures: []
+									};
+								} else {
+									var className = addClassType(cc.c, cc.params);
+									{
+										target: TypeSupport.memberSymbol(className, cf.get().name),
+										captures: [{t: target.t, expr: addInline(target)}]
+									};
+								}
 					}
 				default:
 					Context.error("Unsupported function value", u.pos);
 					{
-						target: "__invalid_fn",
+						target: "_invalid_fn",
 						captures: []
 					};
 			}
@@ -773,7 +959,7 @@ class Transpiler {
 				}
 				var subject = subjectOverride != null ? subjectOverride : addInline(es);
 				if (isEnumSwitch)
-					subject += "." + "__tag";
+					subject += "." + "_tag";
 				var current = edef != null ? functionValueExpr(edef, expected) : "0";
 				for (i in 0...cases.length) {
 					var c = cases[cases.length - 1 - i];
@@ -875,26 +1061,24 @@ class Transpiler {
 					false;
 			}
 		}
-		function emitStatement(e:TypedExpr, d:Int) {
+		function emitStatement(e:TypedExpr) {
 			var stmt = unwrapWrapperExpr(e);
 			var needsSemi = needsSemicolon(stmt);
-			buf.add(addExpr(stmt, needsSemi, !needsSemi, d));
+			buf.add(addExpr(stmt, false));
+			if (needsSemi)
+				buf.add(";");
 		}
-		function emitAsBlock(e:TypedExpr, d:Int) {
+		function emitAsBlock(e:TypedExpr) {
 			var branch = unwrapWrapperExpr(e);
 			switch branch.expr {
 				case TBlock(_):
-					// block already carries its own internal indentation; avoid extra tabs before "{"
-					buf.add(addExpr(branch, false, false, d, false));
+					buf.add(addExpr(branch, false));
 				default:
-					buf.add("{\n");
-					emitStatement(branch, d + 1);
-					indent(d);
+					buf.add("{");
+					emitStatement(branch);
 					buf.add("}");
 			}
 		}
-		if (makeIdent)
-			indent();
 		switch expr.expr {
 			case TConst(TInt(v)):
 				buf.add(v);
@@ -907,9 +1091,9 @@ class Transpiler {
 			case TConst(TNull):
 				buf.add("0");
 			case TConst(TThis):
-				buf.add("__self");
+				buf.add("_self");
 			case TConst(TSuper):
-				buf.add("__self");
+				buf.add("_self");
 			case TLocal(v):
 				buf.add(localName(v));
 			case TArray(e1, e2):
@@ -924,48 +1108,54 @@ class Transpiler {
 					case FInstance(c, params, cf):
 						var field = cf.get();
 						var owner = c.get();
+						TypeSupport.markClassFieldUsed(owner, field, false);
 						switch field.kind {
 							case FVar(_, _):
 								assertNonLocalVarAccess(field, owner, expr.pos);
 								var uniformName = TypeSupport.uniformNameForField(owner, field);
-								if (uniformName != null) buf.add(uniformName); else buf.add(addInline(e) + "." + TypeSupport.fieldNativeName(field));
+								if (uniformName != null) {
+									var fieldType = owner.params.length == params.length ? field.type.applyTypeParameters(owner.params, params) : field.type;
+									buf.add(ensureUniformLocal(owner, field, uniformName, fieldType));
+								} else buf.add(addInline(e) + "." + TypeSupport.fieldNativeName(field));
 							case FMethod(_):
 								if (owner.isExtern || field.meta.has(":native")) buf.add(addInline(e) + "." + TypeSupport.fieldNativeName(field)); else {
 									if (isNoThisInlineMethod(owner, field))
 										buf.add(ensureNoThisInlineMethod(owner, field));
 									else {
 										var className = addClassType(c, params);
-										buf.add(className + "_" + TypeSupport.sanitizeIdent(field.name));
+										buf.add(TypeSupport.memberSymbol(className, field.name));
 									}
 								}
 						}
 					case FStatic(c, cf):
 						var owner = c.get();
 						var field = cf.get();
+						TypeSupport.markClassFieldUsed(owner, field, true);
 						if (isVarField(field))
 							assertNonLocalVarAccess(field, owner, expr.pos);
 						var uniformName = TypeSupport.uniformNameForField(owner, field);
-						if (uniformName != null) buf.add(uniformName); else if (owner.isExtern || field.meta.has(":native"))
-							buf.add(TypeSupport.fieldNativeName(field)); else {
-							var className = addClassType(c, []);
-							buf.add(className + "_" + TypeSupport.sanitizeIdent(field.name));
-						}
+							if (uniformName != null) buf.add(ensureUniformLocal(owner, field, uniformName,
+								field.type)); else if (owner.isExtern || field.meta.has(":native")) buf.add(TypeSupport.fieldNativeName(field)); else {
+								var className = addClassType(c, []);
+								buf.add(TypeSupport.memberSymbol(className, field.name));
+							}
 					case FAnon(cf):
 						buf.add(addInline(e) + "." + TypeSupport.sanitizeIdent(cf.get().name));
 					case FDynamic(s):
 						buf.add(addInline(e) + "." + TypeSupport.sanitizeIdent(s));
 					case FClosure(c, cf):
 						if (c == null) buf.add(TypeSupport.sanitizeIdent(cf.get().name)); else {
+							TypeSupport.markClassFieldUsed(c.c.get(), cf.get(), false);
 							var owner = c.c.get();
 							if (owner.isExtern || cf.get().meta.has(":native"))
 								buf.add(TypeSupport.fieldNativeName(cf.get()));
-							else if (isNoThisInlineMethod(owner, cf.get()))
-								buf.add(ensureNoThisInlineMethod(owner, cf.get()));
-							else {
-								var ownerName = addClassType(c.c, c.params);
-								buf.add(ownerName + "_" + TypeSupport.sanitizeIdent(cf.get().name));
+								else if (isNoThisInlineMethod(owner, cf.get()))
+									buf.add(ensureNoThisInlineMethod(owner, cf.get()));
+								else {
+									var ownerName = addClassType(c.c, c.params);
+									buf.add(TypeSupport.memberSymbol(ownerName, cf.get().name));
+								}
 							}
-						}
 					case FEnum(enumRef, ef):
 						var enumTypeName = addTypeDef(TypeSupport.defEnum(enumRef.get(), []));
 						var ctorName = enumTypeName + "_" + ef.name;
@@ -1017,8 +1207,9 @@ class Transpiler {
 				}
 				switch callee.expr {
 					case TIdent("enumIndex") if (el.length == 1):
-						buf.add(addInline(el[0]) + "." + "__tag");
+						buf.add(addInline(el[0]) + "." + "_tag");
 					case TField(target, FInstance(c, params, cf)):
+						TypeSupport.markClassFieldUsed(c.get(), cf.get(), false);
 						switch cf.get().kind {
 							case FMethod(_):
 								if (c.get()
@@ -1026,22 +1217,23 @@ class Transpiler {
 									.meta.has(":native")) buf.add(addInline(target) + "." + TypeSupport.fieldNativeName(cf.get()) + "(" + args.join(", ") +
 										")"); else {
 									var owner = c.get();
-									if (isNoThisInlineMethod(owner, cf.get()))
-										buf.add(ensureNoThisInlineMethod(owner, cf.get()) + "(" + args.join(", ") + ")");
-									else if (isNoThisMethod(owner, cf.get())) {
-										var className = addClassType(c, params);
-										buf.add((className + "_" + TypeSupport.sanitizeIdent(cf.get().name)) + "(" + args.join(", ") + ")");
-									} else {
-										var className = addClassType(c, params);
-										args.unshift(addInline(target));
-										buf.add((className + "_" + TypeSupport.sanitizeIdent(cf.get().name)) + "(" + args.join(", ") + ")");
+										if (isNoThisInlineMethod(owner, cf.get()))
+											buf.add(ensureNoThisInlineMethod(owner, cf.get()) + "(" + args.join(", ") + ")");
+										else if (isNoThisMethod(owner, cf.get())) {
+											var className = addClassType(c, params);
+											buf.add(TypeSupport.memberSymbol(className, cf.get().name) + "(" + args.join(", ") + ")");
+										} else {
+											var className = addClassType(c, params);
+											args.unshift(addInline(target));
+											buf.add(TypeSupport.memberSymbol(className, cf.get().name) + "(" + args.join(", ") + ")");
+										}
 									}
-								}
 							case FVar(_, _):
 								assertNonLocalVarAccess(cf.get(), c.get(), callee.pos);
 								emitDispatch();
 						}
 					case TField(_, FStatic(c, cf)):
+						TypeSupport.markClassFieldUsed(c.get(), cf.get(), true);
 						switch cf.get().kind {
 							case FMethod(_):
 								buf.add(addInline(callee) + "(" + args.join(", ") + ")");
@@ -1049,12 +1241,16 @@ class Transpiler {
 								assertNonLocalVarAccess(cf.get(), c.get(), callee.pos);
 								emitDispatch();
 						}
-					case TField(_, FEnum(_, _)):
-						buf.add(addInline(callee) + "(" + args.join(", ") + ")");
-					default:
-						if (isFunctionValueCallee(callee)) emitDispatch(); else buf.add(addInline(callee) + "(" + args.join(", ") + ")");
-				}
+						case TField(_, FEnum(_, _)):
+							buf.add(addInline(callee) + "(" + args.join(", ") + ")");
+						default:
+							if (isFunctionType(callee.t) || isFunctionValueCallee(callee))
+								emitDispatch();
+							else
+								buf.add(addInline(callee) + "(" + args.join(", ") + ")");
+					}
 			case TNew(c, params, el):
+				TypeSupport.markClassConstructed(c.get());
 				var typeName = addClassType(c, params);
 				buf.add(typeName + "(" + el.map(e -> addInline(e)).join(", ") + ")");
 			case TUnop(op, postFix, e):
@@ -1072,7 +1268,7 @@ class Transpiler {
 				if (einit != null)
 					buf.add(" = " + (isFunctionType(v.t) ? functionValueExpr(einit, v.t) : addInline(einit)));
 			case TBlock(el):
-				buf.add("{\n");
+				buf.add("{");
 				var localUses = collectLocalUseCounts(el);
 				var terminated = false;
 				for (e in el) {
@@ -1086,7 +1282,7 @@ class Transpiler {
 					}
 					if (skip)
 						continue;
-					emitStatement(stmt, depth + 1);
+					emitStatement(stmt);
 					terminated = switch stmt.expr {
 						case TReturn(_), TBreak, TContinue:
 							true;
@@ -1094,56 +1290,50 @@ class Transpiler {
 							false;
 					}
 				}
-				indent();
 				buf.add("}");
 			case TFor(v, e1, e2):
 				var s = localName(v);
 				switch e1.expr {
 					case TBinop(OpInterval, eFrom, eTo):
 						buf.add('for (${addType(v.t)} $s = ${addInline(eFrom)}; $s < ${addInline(eTo)}; $s++) ');
-						emitAsBlock(e2, depth);
+						emitAsBlock(e2);
 					default:
 						var p = Context.getPosInfos(expr.pos);
-						var iterName = "__iter_" + p.min + "_" + p.max;
-						buf.add("{\n");
-						indent(depth + 1);
-						buf.add(addType(e1.t) + " " + iterName + " = " + addInline(e1) + ";\n");
-						indent(depth + 1);
-						buf.add("while (" + iterName + ".hasNext()) {\n");
-						indent(depth + 2);
-						buf.add(addType(v.t) + " " + s + " = " + iterName + ".next();\n");
+						var iterName = "_iter_" + p.min + "_" + p.max;
+						buf.add("{");
+						buf.add(addType(e1.t) + " " + iterName + " = " + addInline(e1) + ";");
+						buf.add("while (" + iterName + ".hasNext()) {");
+						buf.add(addType(v.t) + " " + s + " = " + iterName + ".next();");
 						var loopBody = unwrapWrapperExpr(e2);
 						switch loopBody.expr {
 							case TBlock(el):
 								for (stmt in el)
-									emitStatement(stmt, depth + 2);
+									emitStatement(stmt);
 							default:
-								emitStatement(loopBody, depth + 2);
+								emitStatement(loopBody);
 						}
-						indent(depth + 1);
-						buf.add("}\n");
-						indent(depth);
+						buf.add("}");
 						buf.add("}");
 				}
 			case TIf(econd, eif, eelse):
-				var isInlineContext = !makeIdent && !endLine && !breakLine;
-				if (isInlineContext && eelse != null && canInlineValueExpr(eif) && canInlineValueExpr(eelse)) {
+				var allowTernaryInline = isInlineContext;
+				if (allowTernaryInline && eelse != null && canInlineValueExpr(eif) && canInlineValueExpr(eelse)) {
 					buf.add("(" + addInline(econd) + " ? " + addInline(unwrapWrapperExpr(eif)) + " : " + addInline(unwrapWrapperExpr(eelse)) + ")");
 				} else {
 					buf.add("if (" + addInline(econd) + ") ");
-					emitAsBlock(eif, depth);
+					emitAsBlock(eif);
 					if (eelse != null) {
 						buf.add(" else ");
-						emitAsBlock(eelse, depth);
+						emitAsBlock(eelse);
 					}
 				}
 			case TWhile(econd, e, normalWhile):
 				if (normalWhile) {
 					buf.add("while (" + addInline(econd) + ") ");
-					emitAsBlock(e, depth);
+					emitAsBlock(e);
 				} else {
 					buf.add("do ");
-					emitAsBlock(e, depth);
+					emitAsBlock(e);
 					buf.add(" while (" + addInline(econd) + ");");
 				}
 			case TSwitch(e, cases, edef):
@@ -1153,53 +1343,43 @@ class Transpiler {
 					default:
 						false;
 				}
-				var switchDepth = makeIdent ? depth : depth + 1;
 				var switchExpr = addInline(e);
 				if (isEnumSwitch)
-					switchExpr += "." + "__tag";
-				buf.add("switch (" + switchExpr + ") {\n");
+					switchExpr += "." + "_tag";
+				buf.add("switch (" + switchExpr + ") {");
 				for (c in cases) {
 					for (v in c.values) {
-						indent(switchDepth + 1);
 						var caseValue = isEnumSwitch ? TypeSupport.enumCaseValueIndex(v) : addInline(v);
-						buf.add("case " + caseValue + ":\n");
+						buf.add("case " + caseValue + ":");
 					}
-					indent(switchDepth + 1);
-					buf.add("{\n");
+					buf.add("{");
 					if (c.expr != null) {
 						var caseExpr = unwrapWrapperExpr(c.expr);
 						switch caseExpr.expr {
 							case TBlock(el):
 								for (stmt in el)
-									emitStatement(stmt, switchDepth + 2);
+									emitStatement(stmt);
 							default:
-								emitStatement(caseExpr, switchDepth + 2);
+								emitStatement(caseExpr);
 						}
 					}
-					indent(switchDepth + 2);
-					buf.add("break;\n");
-					indent(switchDepth + 1);
-					buf.add("}\n");
+					buf.add("break;");
+					buf.add("}");
 				}
 				if (edef != null) {
-					indent(switchDepth + 1);
-					buf.add("default:\n");
-					indent(switchDepth + 1);
-					buf.add("{\n");
+					buf.add("default:");
+					buf.add("{");
 					var defaultExpr = unwrapWrapperExpr(edef);
 					switch defaultExpr.expr {
 						case TBlock(el):
 							for (stmt in el)
-								emitStatement(stmt, switchDepth + 2);
+								emitStatement(stmt);
 						default:
-							emitStatement(defaultExpr, switchDepth + 2);
+							emitStatement(defaultExpr);
 					}
-					indent(switchDepth + 2);
-					buf.add("break;\n");
-					indent(switchDepth + 1);
-					buf.add("}\n");
+					buf.add("break;");
+					buf.add("}");
 				}
-				indent(switchDepth);
 				buf.add("}");
 			case TReturn(e):
 				buf.add("return");
@@ -1221,18 +1401,14 @@ class Transpiler {
 			case TMeta(_, e):
 				buf.add(addInline(e));
 			case TEnumParameter(e1, ef, index):
-				buf.add(addInline(e1) + "." + ("__" + ef.name + "_" + index));
+				buf.add(addInline(e1) + "." + ("_" + ef.name + "_" + index));
 			case TEnumIndex(e1):
-				buf.add(addInline(e1) + "." + "__tag");
+				buf.add(addInline(e1) + "." + "_tag");
 			case TIdent(v):
 				buf.add(TypeSupport.sanitizeIdent(v));
 			default:
 				Context.error("Invalid expression", expr.pos);
 		}
-		if (endLine)
-			buf.add(";\n");
-		if (breakLine)
-			buf.add("\n");
 		return {
 			statics: statics,
 			expr: buf.toString()
@@ -1287,7 +1463,7 @@ class Transpiler {
 			return existing;
 		TypeSupport.curDispatcherSeq++;
 		var created:FunctionDispatcher = {
-			name: "__fn_dispatch_" + TypeSupport.curDispatcherSeq,
+			name: "_fn_dispatch_" + TypeSupport.curDispatcherSeq,
 			retType: retType,
 			argTypes: argTypes.copy(),
 			cases: [],
@@ -1306,13 +1482,16 @@ class Transpiler {
 		if (existing != null)
 			return existing;
 		var id = dispatcher.nextId++;
+		var dispatcherStem = dispatcher.name;
+		while (StringTools.startsWith(dispatcherStem, "_"))
+			dispatcherStem = dispatcherStem.substr(1);
 		var captureVars = [];
 		for (i in 0...captureTypes.length)
-			captureVars.push("__fn_cap_" + dispatcher.name + "_" + id + "_" + i);
+			captureVars.push("_fn_cap_" + dispatcherStem + "_" + id + "_" + i);
 		var c:FunctionDispatcherCase = {
 			id: id,
 			target: target,
-			makeName: captureTypes.length == 0 ? null : "__fn_make_" + dispatcher.name + "_" + id,
+			makeName: captureTypes.length == 0 ? null : "_fn_make_" + dispatcherStem + "_" + id,
 			captureTypes: captureTypes.copy(),
 			captureVars: captureVars
 		};
@@ -1341,9 +1520,9 @@ class Transpiler {
 		for (d in TypeSupport.curDispatchers) {
 			var b = new StringBuf();
 			var argNames = [];
-			var signature = ["int __fn"];
+			var signature = ["int _fn"];
 			for (i in 0...d.argTypes.length) {
-				var argName = "__a" + i;
+				var argName = "_a" + i;
 				argNames.push(argName);
 				signature.push(d.argTypes[i] + " " + argName);
 			}
@@ -1351,49 +1530,106 @@ class Transpiler {
 				if (c.captureTypes.length == 0)
 					continue;
 				for (i in 0...c.captureTypes.length)
-					b.add(c.captureTypes[i] + " " + c.captureVars[i] + ";\n");
+					b.add(c.captureTypes[i] + " " + c.captureVars[i] + ";");
 				var makeSig = [];
 				for (i in 0...c.captureTypes.length)
-					makeSig.push(c.captureTypes[i] + " __cap" + i);
-				b.add("int " + c.makeName + "(" + makeSig.join(", ") + ") {\n");
+					makeSig.push(c.captureTypes[i] + " _cap" + i);
+				b.add("int " + c.makeName + "(" + makeSig.join(", ") + "){");
 				for (i in 0...c.captureTypes.length)
-					b.add("\t" + c.captureVars[i] + " = __cap" + i + ";\n");
-				b.add("\treturn " + c.id + ";\n");
-				b.add("}\n");
+					b.add(c.captureVars[i] + " = _cap" + i + ";");
+				b.add("return " + c.id + ";");
+				b.add("}");
 			}
-			b.add(d.retType + " " + d.name + "(" + signature.join(", ") + ") {\n");
-			b.add("\tswitch (__fn) {\n");
+			b.add(d.retType + " " + d.name + "(" + signature.join(", ") + "){");
+			b.add("switch (_fn){");
 			for (c in d.cases) {
-				b.add("\t\tcase " + c.id + ":\n");
-				b.add("\t\t{\n");
+				b.add("case " + c.id + ":{");
 				var callArgs = c.captureVars.copy().concat(argNames);
 				if (d.retType == "Void" || d.retType == "void") {
-					b.add("\t\t\t" + c.target + "(" + callArgs.join(", ") + ");\n");
-					b.add("\t\t\treturn;\n");
+					b.add(c.target + "(" + callArgs.join(", ") + ");");
+					b.add("return;");
 				} else {
-					b.add("\t\t\treturn " + c.target + "(" + callArgs.join(", ") + ");\n");
+					b.add("return " + c.target + "(" + callArgs.join(", ") + ");");
 				}
-				b.add("\t\t}\n");
+				b.add("}");
 			}
-			b.add("\t\tdefault:\n");
-			b.add("\t\t{\n");
+			b.add("default:{");
 			if (d.retType == "Void" || d.retType == "void")
-				b.add("\t\t\treturn;\n");
+				b.add("return;");
 			else {
 				var def = defaultValueExpr(d.retType);
 				if (def != null)
-					b.add("\t\t\treturn " + def + ";\n");
+					b.add("return " + def + ";");
 				else {
-					b.add("\t\t\t" + d.retType + " __fallback;\n");
-					b.add("\t\t\treturn __fallback;\n");
+					b.add(d.retType + " _fallback;");
+					b.add("return _fallback;");
 				}
 			}
-			b.add("\t\t}\n");
-			b.add("\t}\n");
-			b.add("}\n");
+			b.add("}");
+			b.add("}");
+			b.add("}");
 			defs.push(b.toString());
 		}
 		return defs;
+	}
+
+	static function buildDispatcherDecls():Array<String> {
+		if (TypeSupport.curDispatchers == null || !TypeSupport.curDispatchers.iterator().hasNext())
+			return [];
+		var out = [];
+		for (d in TypeSupport.curDispatchers) {
+			for (c in d.cases) {
+				if (c.captureTypes.length == 0)
+					continue;
+				var makeSig = [];
+				for (i in 0...c.captureTypes.length)
+					makeSig.push(c.captureTypes[i] + " _cap" + i);
+				out.push("int " + c.makeName + "(" + makeSig.join(", ") + ");");
+			}
+			var signature = ["int _fn"];
+			for (i in 0...d.argTypes.length)
+				signature.push(d.argTypes[i] + " _a" + i);
+			out.push(d.retType + " " + d.name + "(" + signature.join(", ") + ");");
+		}
+		return out;
+	}
+
+	static function dispatcherDeclInsertIndex(statics:Array<String>):Int {
+		if (TypeSupport.curDispatchers == null || !TypeSupport.curDispatchers.iterator().hasNext() || statics == null || statics.length == 0)
+			return 0;
+		function isBuiltinTypeName(name:String):Bool {
+			if (name == null || name.length == 0)
+				return true;
+			var first = name.charCodeAt(0);
+			return (first >= "a".code && first <= "z".code) || name == "void" || name == "Void";
+		}
+		function typeDeclPos(name:String):Int {
+			for (i in 0...statics.length) {
+				var s = statics[i];
+				if (s == null)
+					continue;
+				if (s.indexOf("struct " + name + " ") != -1 || s.indexOf("struct " + name + "{") != -1 || s.indexOf("#define " + name + " ") != -1)
+					return i;
+			}
+			return -1;
+		}
+		var out = 0;
+		for (d in TypeSupport.curDispatchers) {
+			var typeNames = [d.retType];
+			for (t in d.argTypes)
+				typeNames.push(t);
+			for (c in d.cases)
+				for (t in c.captureTypes)
+					typeNames.push(t);
+			for (t in typeNames) {
+				if (isBuiltinTypeName(t))
+					continue;
+				var p = typeDeclPos(t);
+				if (p >= out)
+					out = p + 1;
+			}
+		}
+		return out;
 	}
 }
 #end

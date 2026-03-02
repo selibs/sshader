@@ -2,41 +2,27 @@ package sshader;
 
 #if macro
 import sys.io.File;
-import haxe.macro.Expr;
+import haxe.io.Bytes;
 import haxe.macro.Context;
+import haxe.macro.Expr;
 import sshader.transpiler.Transpiler;
 #end
 
 class ShaderBuilder {
 	#if macro
 	public static function build() {
-		function isShaderSource(field:{name:String, meta:Array<MetadataEntry>}) {
-			var isShader = field.name == "vert" || field.name == "frag";
-			if (!isShader)
-				for (m in field.meta)
-					switch m.name {
-						case ":shader.source":
-							isShader = true;
-							break;
-						default:
-							continue;
-					}
-			return isShader;
-		}
-
 		var fields = Context.getBuildFields();
 
 		for (field in fields)
-			if (isShaderSource(field))
+			if (field.name == "vert" || field.name == "frag")
 				switch field.kind {
 					case FFun(f):
-						var e = macro return null;
 						f.expr = {
 							expr: switch f.expr.expr {
 								case EBlock(exprs):
-									EBlock(exprs.concat([e]));
+									EBlock(exprs.concat([macro return null]));
 								default:
-									EBlock([f.expr, e]);
+									EBlock([f.expr, macro return null]);
 							},
 							pos: f.expr.pos
 						}
@@ -44,14 +30,13 @@ class ShaderBuilder {
 						Context.error(field.name + " must be function", field.pos);
 				}
 
-		var isBuilt = false;
-		Context.onAfterTyping(_ -> {
+		Context.onGenerate(_ -> {
 			var cls = Context.getLocalClass()?.get();
-			if (isBuilt || cls == null)
+			if (cls == null)
 				return;
 
 			for (field in cls.fields.get())
-				if (isShaderSource({name: field.name, meta: field.meta.get()})) {
+				if (field.name == "vert" || field.name == "frag") {
 					var src = Transpiler.buildShaderSource(cls, field);
 					File.saveContent(cls.name + "." + field.name + ".glsl", src.toString());
 				}
