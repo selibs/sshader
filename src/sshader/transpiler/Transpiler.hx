@@ -8,7 +8,6 @@ import sshader.ShaderSource;
 import sshader.transpiler.Types;
 
 using haxe.macro.TypeTools;
-using haxe.macro.ComplexTypeTools;
 using haxe.macro.TypedExprTools;
 
 class Transpiler {
@@ -24,50 +23,46 @@ class Transpiler {
 		return name == "frag" || name == "_frag_";
 	}
 
-	public static function buildShaderSource(owner:ClassType, field:ClassField):ShaderSource {
-		switch field.expr().expr {
-			case TFunction(tfunc):
-				var snapshot = TypeSupport.beginEntryContext(owner);
-				TypeSupport.collectUsageFromExpr(tfunc.expr);
-					var linkedVertOut:Null<Array<{
-						name:String,
-						location:Int,
-						typeSig:String,
-						typeName:String,
-						interp:VaryingInterp
-					}>> = null;
-				if (isFragEntryName(field.name)) {
-					var vertField:Null<ClassField> = null;
-					for (f in owner.fields.get())
-						if (isVertEntryName(f.name)) {
-							vertField = f;
-							break;
-						}
-					if (vertField != null) {
-						var expr = vertField.expr();
-						if (expr != null)
-							switch expr.expr {
-								case TFunction(vfunc):
-									linkedVertOut = collectVaryingLayoutFromReturn(vfunc.t, vertField.pos);
-								default:
-									Context.error('Vertex entry point "vert" should be function', vertField.pos);
-							}
-					}
-				}
-				var p = Transpiler.entryPoint(owner, tfunc, field.pos, isFragEntryName(field.name), linkedVertOut);
-					var s = new ShaderSource();
-					s.stage = isFragEntryName(field.name) ? "frag" : "vert";
-					s.uniforms = TypeSupport.usedUniforms();
-				s.varIn = p.varIn;
-				s.varOut = p.varOut;
-				s.statics = p.body.statics;
-				s.main = p.body.expr;
-				TypeSupport.endEntryContext(snapshot);
-				return s;
+	static inline function isGlslInterfaceTypeName(name:String):Bool {
+		return switch name {
+			case "bool", "int", "uint", "float", "double", "bvec2", "bvec3", "bvec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3", "uvec4", "vec2",
+				"vec3", "vec4", "dvec2", "dvec3", "dvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2",
+				"mat4x3", "mat4x4", "dmat2", "dmat3", "dmat4", "dmat2x2", "dmat2x3", "dmat2x4", "dmat3x2", "dmat3x3", "dmat3x4", "dmat4x2", "dmat4x3",
+				"dmat4x4":
+				true;
 			default:
-				Context.error("Shader entry point should be function", field.pos);
-				return null;
+				false;
 		}
+	}
+
+	public static function collectEntryVaryingLayout(func:TFunc, pos:Position):Array<{
+		name:String,
+		location:Int,
+		typeSig:String,
+		typeName:String,
+		interp:VaryingInterp
+	}> {
+		return collectVaryingLayoutFromReturn(func.t, pos);
+	}
+
+	public static function buildShaderSource(owner:ClassType, entryName:String, entryPos:Position, func:TFunc, ?linkedVertOut:Array<{
+		name:String,
+		location:Int,
+		typeSig:String,
+		typeName:String,
+		interp:VaryingInterp
+	}>):ShaderSource {
+		var snapshot = TypeSupport.beginEntryContext(owner);
+		var p = Transpiler.entryPoint(owner, func, entryPos, isFragEntryName(entryName), linkedVertOut);
+		var s = new ShaderSource();
+		s.stage = isFragEntryName(entryName) ? "frag" : "vert";
+		s.uniforms = TypeSupport.usedUniforms();
+		s.varIn = p.varIn;
+		s.varOut = p.varOut;
+		s.statics = p.body.statics;
+		s.main = p.body.expr;
+		TypeSupport.endEntryContext(snapshot);
+		return s;
 	}
 
 	static function parseLocation(meta:MetaAccess, i:Int):Int {
@@ -197,42 +192,32 @@ class Transpiler {
 			meta:MetaAccess,
 			pos:Position
 		}>, forFragInput:Bool, kind:String) {
-			inline function isInterfaceTypeName(name:String):Bool {
-				return switch name {
-					case "bool", "int", "uint", "float", "double", "bvec2", "bvec3", "bvec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3", "uvec4",
-						"vec2", "vec3", "vec4", "dvec2", "dvec3", "dvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3",
-						"mat3x4", "mat4x2", "mat4x3", "mat4x4", "dmat2", "dmat3", "dmat4", "dmat2x2", "dmat2x3", "dmat2x4", "dmat3x2", "dmat3x3",
-						"dmat3x4", "dmat4x2", "dmat4x3", "dmat4x4":
-						true;
-					default:
-						false;
-				}
-			}
 			var varyings = [];
 			var vertOutByName = new Map<String, Int>();
-				var vertOutByLocation = new Map<Int, {name:String, typeSig:String, typeName:String, interp:VaryingInterp}>();
+			var vertOutByLocation = new Map<Int, {name:String, typeSig:String, typeName:String, interp:VaryingInterp}>();
 			var usedLocationNames = new Map<Int, String>();
-			if (forFragInput && vertOutLayout != null)
+			if (forFragInput && vertOutLayout != null) {
 				for (v in vertOutLayout) {
 					if (!vertOutByName.exists(v.name))
 						vertOutByName.set(v.name, v.location);
-						vertOutByLocation.set(v.location, {
-							name: v.name,
-							typeSig: v.typeSig,
-							typeName: v.typeName,
-							interp: v.interp
-						});
-					}
-				for (i in 0...args.length) {
-					var a = args[i];
-					var name = TypeSupport.sanitizeIdent(a.name);
-					var type = a.type;
-					var argPos = a.pos;
-					if (!isInterfaceTypeName(type.name))
-						Context.error('Unsupported GLSL interface type "${type.name}" for $kind varying "$name". Use scalar/vector/matrix types.', argPos);
-					var typeSig = a.typeSig;
-					var meta = a.meta;
-					var location = if (forFragInput) {
+					vertOutByLocation.set(v.location, {
+						name: v.name,
+						typeSig: v.typeSig,
+						typeName: v.typeName,
+						interp: v.interp
+					});
+				}
+			}
+			for (i in 0...args.length) {
+				var a = args[i];
+				var name = TypeSupport.sanitizeIdent(a.name);
+				var type = a.type;
+				var argPos = a.pos;
+				if (!isGlslInterfaceTypeName(type.name))
+					Context.error('Unsupported GLSL interface type "${type.name}" for $kind varying "$name". Use scalar/vector/matrix types.', argPos);
+				var typeSig = a.typeSig;
+				var meta = a.meta;
+				var location = if (forFragInput) {
 					if (meta.has("location")) {
 						var l = parseLocation(meta, i);
 						if (!vertOutByLocation.exists(l))
@@ -250,24 +235,24 @@ class Transpiler {
 					Context.error('Duplicate $kind varying location $location for "$name" and "$prevAtLocation".', argPos);
 				usedLocationNames.set(location, name);
 				if (forFragInput) {
-						var vert = vertOutByLocation.get(location);
-						if (vert != null && vert.typeSig != typeSig)
-							Context.error('Type mismatch at location $location: fragment input "$name" (${type.name}) is incompatible with vertex output "${vert.name}" (${vert.typeName}).',
-								argPos);
-					}
-					var interp = parseInterp(meta);
-					if (forFragInput && !hasInterpMeta(meta)) {
-						var vert = vertOutByLocation.get(location);
-						if (vert != null)
-							interp = vert.interp;
-					}
-					varyings.push({
-						name: name,
-						type: type,
-						interp: interp,
-						location: location
-					});
+					var vert = vertOutByLocation.get(location);
+					if (vert != null && vert.typeSig != typeSig)
+						Context.error('Type mismatch at location $location: fragment input "$name" (${type.name}) is incompatible with vertex output "${vert.name}" (${vert.typeName}).',
+							argPos);
 				}
+				var interp = parseInterp(meta);
+				if (forFragInput && !hasInterpMeta(meta)) {
+					var vert = vertOutByLocation.get(location);
+					if (vert != null)
+						interp = vert.interp;
+				}
+				varyings.push({
+					name: name,
+					type: type,
+					interp: interp,
+					location: location
+				});
+			}
 			return varyings;
 		}
 		function uniquifyInterfaceNames(varIn:Array<Varying>, varOut:Array<Varying>):Void {
@@ -324,33 +309,30 @@ class Transpiler {
 		}
 		if (isFrag && func.args.length > 0 && vertOutLayout == null)
 			Context.error('Fragment entry point requires vertex entry point "vert" with output varyings.', pos);
-		var argEntries = func.args.map(a -> ({
-			id: a.v.id,
-			name: a.v.name,
-			type: TypeSupport.defType(a.v.t, pos),
-			typeSig: Context.signature(a.v.t.follow()),
-			meta: a.v.meta,
-			pos: pos
-		}));
-			var varIn = parseVarying(argEntries.map(a -> ({
-				name: a.name,
-				type: a.type,
-				typeSig: a.typeSig,
-				meta: a.meta,
-				pos: a.pos
-			})), isFrag, "input");
-			var varOut = getVarOut(func.t);
-			uniquifyInterfaceNames(varIn, varOut);
-			var ctx:TransContext = {
-				locals: new Map(),
-				usedLocalNames: new Map(),
-				prologue: [],
-				uniformLocals: new Map(),
+		var argEntries = func.args.map(a -> {
+			var argPos = a.value != null ? a.value.pos : pos;
+			return {
+				id: a.v.id,
+				name: a.v.name,
+				type: TypeSupport.defType(a.v.t, argPos),
+				typeSig: Context.signature(a.v.t.follow()),
+				meta: a.v.meta,
+				pos: argPos
+			};
+		});
+		var varIn = parseVarying(argEntries, isFrag, "input");
+		var varOut = getVarOut(func.t);
+		uniquifyInterfaceNames(varIn, varOut);
+		var ctx:TransContext = {
+			locals: new Map(),
+			usedLocalNames: new Map(),
+			prologue: [],
+			uniformLocals: new Map(),
 			enableUniformLocalAlias: true
 		};
 		for (v in varIn)
 			ctx.usedLocalNames.set(TypeSupport.sanitizeIdent(v.name), 1);
-		for (uniformName in TypeSupport.uniformCandidateNames(owner))
+		for (uniformName in TypeSupport.usedUniformNames())
 			ctx.usedLocalNames.set(uniformName, 1);
 		for (i in 0...argEntries.length) {
 			var arg = argEntries[i];
@@ -358,25 +340,25 @@ class Transpiler {
 			ctx.locals.set(arg.id, local);
 			ctx.prologue.push(varIn[i].type.name + " " + local + " = " + varIn[i].name);
 		}
-			var body = transExpr(func.expr, ctx);
-			var mergedStatics = body.statics.copy();
-			var dispatcherDecls = buildDispatcherDecls();
-			var declInsertAt = dispatcherDeclInsertIndex(mergedStatics);
-			for (i in 0...dispatcherDecls.length)
-				mergedStatics.insert(declInsertAt + i, dispatcherDecls[i]);
-			var dispatchers = buildDispatchers();
-			for (d in dispatchers)
-				mergedStatics.push(d);
-			var ep = {
-				varIn: varIn,
-				varOut: varOut,
-				body: {
-					statics: mergedStatics,
-					expr: prependPrologue(body.expr, ctx.prologue)
-				}
+		var body = transExpr(func.expr, ctx);
+		var mergedStatics = body.statics.copy();
+		var dispatcherDecls = buildDispatcherDecls();
+		var declInsertAt = dispatcherDeclInsertIndex(mergedStatics);
+		for (i in 0...dispatcherDecls.length)
+			mergedStatics.insert(declInsertAt + i, dispatcherDecls[i]);
+		var dispatchers = buildDispatchers();
+		for (d in dispatchers)
+			mergedStatics.push(d);
+		var ep = {
+			varIn: varIn,
+			varOut: varOut,
+			body: {
+				statics: mergedStatics,
+				expr: prependPrologue(body.expr, ctx.prologue)
 			}
-			return ep;
 		}
+		return ep;
+	}
 
 	public static function transExpr(expr:TypedExpr, ctx:TransContext = null, isInlineContext:Bool = false):EntryPointBody {
 		if (ctx == null)
@@ -416,6 +398,9 @@ class Transpiler {
 				default:
 					false;
 			}
+		}
+		inline function markUsed(owner:ClassType, field:ClassField, isStatic:Bool):Void {
+			TypeSupport.markClassFieldUsed(owner, field, isStatic);
 		}
 		function assertNonLocalVarAccess(field:ClassField, owner:ClassType, p:Position) {
 			if (TypeSupport.useUniformField(owner, field) != null || field.isFinal)
@@ -626,100 +611,6 @@ class Transpiler {
 					true;
 			}
 		}
-		function collectLocalUseCounts(el:Array<TypedExpr>):Map<Int, Int> {
-			var out = new Map<Int, Int>();
-			function bump(id:Int) {
-				var cur = out.get(id);
-				out.set(id, cur == null ? 1 : (cur + 1));
-			}
-			function visit(node:TypedExpr) {
-				var u = unwrapWrapperExpr(node);
-				switch u.expr {
-					case TField(_, FInstance(c, _, cf)):
-						if (isNoThisMethod(c.get(), cf.get()))
-							return;
-					case TField(_, FClosure(c, cf)):
-						if (c != null && isNoThisMethod(c.c.get(), cf.get()))
-							return;
-					case TCall(callee, args):
-						var uCallee = unwrapWrapperExpr(callee);
-						switch uCallee.expr {
-							case TField(_, FInstance(c, _, cf)):
-								if (isNoThisMethod(c.get(), cf.get())) {
-									for (a in args)
-										visit(a);
-									return;
-								}
-							default:
-						}
-					default:
-				}
-				switch u.expr {
-					case TLocal(v):
-						bump(v.id);
-					default:
-				}
-				u.iter(visit);
-			}
-			for (stmt in el)
-				visit(stmt);
-			return out;
-		}
-		function isPureExpr(e:TypedExpr):Bool {
-			var u = unwrapWrapperExpr(e);
-			return switch u.expr {
-				case TConst(_), TLocal(_), TTypeExpr(_):
-					true;
-				case TParenthesis(inner):
-					isPureExpr(inner);
-				case TCast(inner, _):
-					isPureExpr(inner);
-				case TMeta(_, inner):
-					isPureExpr(inner);
-				case TArray(a, b): isPureExpr(a) && isPureExpr(b);
-				case TObjectDecl(fields):
-					var pure = true;
-					for (f in fields)
-						if (!isPureExpr(f.expr)) {
-							pure = false;
-							break;
-						}
-					pure;
-				case TArrayDecl(values):
-					var pure = true;
-					for (v in values)
-						if (!isPureExpr(v)) {
-							pure = false;
-							break;
-						}
-					pure;
-				case TBinop(op, a, b):
-					switch op {
-						case OpAssign, OpAssignOp(_):
-							false;
-						default: isPureExpr(a) && isPureExpr(b);
-					}
-				case TUnop(op, _, inner):
-					switch op {
-						case OpIncrement, OpDecrement:
-							false;
-						default:
-							isPureExpr(inner);
-					}
-				case TNew(c, _, args):
-					if (!TypeSupport.isStatelessTrivialCtorClass(c.get())) false; else {
-						var pure = true;
-						for (a in args)
-							if (!isPureExpr(a)) {
-								pure = false;
-								break;
-							}
-						pure;
-					}
-				default:
-					false;
-			}
-		}
 		function nextHelperName(prefix:String):String {
 			TypeSupport.curHelperSeq++;
 			return prefix + TypeSupport.curHelperSeq;
@@ -841,7 +732,7 @@ class Transpiler {
 				case TFunction(func):
 					lowerLambdaFunction(func, sigType, u.pos);
 				case TField(_, FStatic(c, cf)):
-					TypeSupport.markClassFieldUsed(c.get(), cf.get(), true);
+					markUsed(c.get(), cf.get(), true);
 					if (isVarField(cf.get()))
 						assertNonLocalVarAccess(cf.get(), c.get(), u.pos);
 					if (c.get().isExtern || cf.get().meta.has(":native")) {
@@ -861,7 +752,7 @@ class Transpiler {
 						captures: []
 					};
 				case TField(target, FInstance(c, params, cf)):
-					TypeSupport.markClassFieldUsed(c.get(), cf.get(), false);
+					markUsed(c.get(), cf.get(), false);
 					if (isVarField(cf.get()))
 						assertNonLocalVarAccess(cf.get(), c.get(), u.pos);
 					var owner = c.get();
@@ -1110,7 +1001,7 @@ class Transpiler {
 					case FInstance(c, params, cf):
 						var field = cf.get();
 						var owner = c.get();
-						TypeSupport.markClassFieldUsed(owner, field, false);
+						markUsed(owner, field, false);
 						switch field.kind {
 							case FVar(_, _):
 								assertNonLocalVarAccess(field, owner, expr.pos);
@@ -1132,7 +1023,7 @@ class Transpiler {
 					case FStatic(c, cf):
 						var owner = c.get();
 						var field = cf.get();
-						TypeSupport.markClassFieldUsed(owner, field, true);
+						markUsed(owner, field, true);
 						if (isVarField(field))
 							assertNonLocalVarAccess(field, owner, expr.pos);
 						var uniformName = TypeSupport.uniformNameForField(owner, field);
@@ -1147,7 +1038,7 @@ class Transpiler {
 						buf.add(addInline(e) + "." + TypeSupport.sanitizeIdent(s));
 					case FClosure(c, cf):
 						if (c == null) buf.add(TypeSupport.sanitizeIdent(cf.get().name)); else {
-							TypeSupport.markClassFieldUsed(c.c.get(), cf.get(), false);
+							markUsed(c.c.get(), cf.get(), false);
 							var owner = c.c.get();
 							if (owner.isExtern || cf.get().meta.has(":native"))
 								buf.add(TypeSupport.fieldNativeName(cf.get()));
@@ -1211,7 +1102,7 @@ class Transpiler {
 					case TIdent("enumIndex") if (el.length == 1):
 						buf.add(addInline(el[0]) + "." + "_tag");
 					case TField(target, FInstance(c, params, cf)):
-						TypeSupport.markClassFieldUsed(c.get(), cf.get(), false);
+						markUsed(c.get(), cf.get(), false);
 						switch cf.get().kind {
 							case FMethod(_):
 								if (c.get()
@@ -1235,7 +1126,7 @@ class Transpiler {
 								emitDispatch();
 						}
 					case TField(_, FStatic(c, cf)):
-						TypeSupport.markClassFieldUsed(c.get(), cf.get(), true);
+						markUsed(c.get(), cf.get(), true);
 						switch cf.get().kind {
 							case FMethod(_):
 								buf.add(addInline(callee) + "(" + args.join(", ") + ")");
@@ -1271,19 +1162,11 @@ class Transpiler {
 					buf.add(" = " + (isFunctionType(v.t) ? functionValueExpr(einit, v.t) : addInline(einit)));
 			case TBlock(el):
 				buf.add("{");
-				var localUses = collectLocalUseCounts(el);
 				var terminated = false;
 				for (e in el) {
 					if (terminated)
 						continue;
 					var stmt = unwrapWrapperExpr(e);
-					var skip = switch stmt.expr {
-						case TVar(v, einit): var uses = localUses.get(v.id); (uses == null || uses == 0) && (einit == null || isPureExpr(einit));
-						default:
-							false;
-					}
-					if (skip)
-						continue;
 					emitStatement(stmt);
 					terminated = switch stmt.expr {
 						case TReturn(_), TBreak, TContinue:
@@ -1605,15 +1488,35 @@ class Transpiler {
 			var first = name.charCodeAt(0);
 			return (first >= "a".code && first <= "z".code) || name == "void" || name == "Void";
 		}
-		function typeDeclPos(name:String):Int {
-			for (i in 0...statics.length) {
-				var s = statics[i];
-				if (s == null)
-					continue;
-				if (s.indexOf("struct " + name + " ") != -1 || s.indexOf("struct " + name + "{") != -1 || s.indexOf("#define " + name + " ") != -1)
-					return i;
+		function declTypeName(s:String):Null<String> {
+			if (s == null)
+				return null;
+			var t = StringTools.ltrim(s);
+			function readName(rest:String):Null<String> {
+				var i = 0;
+				while (i < rest.length) {
+					var c = rest.charCodeAt(i);
+					var isDigit = c >= "0".code && c <= "9".code;
+					var isUpper = c >= "A".code && c <= "Z".code;
+					var isLower = c >= "a".code && c <= "z".code;
+					if (isDigit || isUpper || isLower || c == "_".code)
+						i++;
+					else
+						break;
+				}
+				return i == 0 ? null : rest.substr(0, i);
 			}
-			return -1;
+			if (StringTools.startsWith(t, "struct "))
+				return readName(t.substr("struct ".length));
+			if (StringTools.startsWith(t, "#define "))
+				return readName(t.substr("#define ".length));
+			return null;
+		}
+		var declPosByType = new Map<String, Int>();
+		for (i in 0...statics.length) {
+			var n = declTypeName(statics[i]);
+			if (n != null && !declPosByType.exists(n))
+				declPosByType.set(n, i);
 		}
 		var out = 0;
 		for (d in TypeSupport.curDispatchers) {
@@ -1626,7 +1529,9 @@ class Transpiler {
 			for (t in typeNames) {
 				if (isBuiltinTypeName(t))
 					continue;
-				var p = typeDeclPos(t);
+				var p = declPosByType.get(t);
+				if (p == null)
+					p = -1;
 				if (p >= out)
 					out = p + 1;
 			}

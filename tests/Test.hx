@@ -7,5 +7,6 @@ class Test implements Shader {
 		@smooth(centroid) var a:Int;
 	} {
 		var x = 0;
+		var y = x;
 	}
 }

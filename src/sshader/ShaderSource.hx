@@ -30,54 +30,6 @@ typedef TypeDef = {
 }
 
 class ShaderSource {
-	static function formatShaderSource(src:String):String {
-		var out = new StringBuf();
-		var lines = src.split("\n");
-		var depth = 0;
-		var prevBlank = true;
-		for (raw in lines) {
-			var line = StringTools.rtrim(raw);
-			if (line.length == 0) {
-				if (!prevBlank) {
-					out.add("\n");
-					prevBlank = true;
-				}
-				continue;
-			}
-			var trimmed = StringTools.ltrim(line);
-			trimmed = ~/\)\s+\{/.replace(trimmed, ") {");
-			if (StringTools.startsWith(trimmed, "#")) {
-				out.add(trimmed + "\n");
-				prevBlank = false;
-				continue;
-			}
-			var indentDepth = depth;
-			if (StringTools.startsWith(trimmed, "}"))
-				indentDepth--;
-			if (StringTools.startsWith(trimmed, "case ") || StringTools.startsWith(trimmed, "default:"))
-				indentDepth = depth - 1;
-			if (indentDepth < 0)
-				indentDepth = 0;
-			for (_ in 0...indentDepth)
-				out.add("\t");
-			out.add(trimmed + "\n");
-			prevBlank = false;
-			var opens = 0;
-			var closes = 0;
-			for (i in 0...trimmed.length) {
-				var c = trimmed.charCodeAt(i);
-				if (c == "{".code)
-					opens++;
-				else if (c == "}".code)
-					closes++;
-			}
-			depth += opens - closes;
-			if (depth < 0)
-				depth = 0;
-		}
-		return out.toString();
-	}
-
 	public var version:String = "450";
 	public var stage:Null<String> = null;
 	public var uniforms:Array<Uniform> = [];
@@ -90,10 +42,12 @@ class ShaderSource {
 
 	public function toString(format:Bool = false) {
 		var buf = new StringBuf();
-		var preEmitted:Array<String> = [];
-		function addUnique(dst:Array<String>, item:String):Void {
-			if (!dst.contains(item))
-				dst.push(item);
+		var preEmittedSet:Map<String, Bool> = new Map();
+		function addUnique(dst:Array<String>, seen:Map<String, Bool>, item:String):Void {
+			if (seen.exists(item))
+				return;
+			seen.set(item, true);
+			dst.push(item);
 		}
 
 		function addVarying(v:Varying, d:String) {
@@ -125,28 +79,36 @@ class ShaderSource {
 			buf.add('layout(location = ${v.location}) $prefix$d ${v.type.name} ${v.name};\n');
 		}
 
-		function definesType(def:String, typeName:String):Bool {
+		function declaredTypeName(def:String):Null<String> {
 			var s = StringTools.ltrim(def);
-			return StringTools.startsWith(s, "struct " + typeName + " {") || StringTools.startsWith(s, "#define " + typeName + " ");
-		}
-
-		function hasTypeDef(defs:Array<String>, typeName:String):Bool {
-			for (d in defs)
-				if (definesType(d, typeName))
-					return true;
-			return false;
-		}
-
-		function findTypeDefInStatics(typeName:String):Null<String> {
-			for (s in statics)
-				if (definesType(s, typeName))
-					return s;
+			if (StringTools.startsWith(s, "struct ")) {
+				var rest = s.substr("struct ".length);
+				var i = 0;
+				while (i < rest.length) {
+					var c = rest.charCodeAt(i);
+					if (!((c >= "0".code && c <= "9".code) || (c >= "A".code && c <= "Z".code) || (c >= "a".code && c <= "z".code) || c == "_".code))
+						break;
+					i++;
+				}
+				return i > 0 ? rest.substr(0, i) : null;
+			}
+			if (StringTools.startsWith(s, "#define ")) {
+				var rest = s.substr("#define ".length);
+				var i = 0;
+				while (i < rest.length) {
+					var c = rest.charCodeAt(i);
+					if (!((c >= "0".code && c <= "9".code) || (c >= "A".code && c <= "Z".code) || (c >= "a".code && c <= "z".code) || c == "_".code))
+						break;
+					i++;
+				}
+				return i > 0 ? rest.substr(0, i) : null;
+			}
 			return null;
 		}
-		function collectTypeDef(types:Array<String>, typeNames:Array<String>, t:TypeDef):Void {
-			addUnique(typeNames, t.name);
+		function collectTypeDef(types:Array<String>, typesSeen:Map<String, Bool>, typeNames:Array<String>, typeNamesSeen:Map<String, Bool>, t:TypeDef):Void {
+			addUnique(typeNames, typeNamesSeen, t.name);
 			for (d in t.def)
-				addUnique(types, d);
+				addUnique(types, typesSeen, d);
 		}
 
 		// version
@@ -154,22 +116,36 @@ class ShaderSource {
 			buf.add('#version $version\n\n');
 
 		var headerTypes:Array<String> = [];
+		var headerTypesSeen:Map<String, Bool> = new Map();
 		var headerTypeNames:Array<String> = [];
+		var headerTypeNamesSeen:Map<String, Bool> = new Map();
 		for (u in uniforms)
-			collectTypeDef(headerTypes, headerTypeNames, u.type);
+			collectTypeDef(headerTypes, headerTypesSeen, headerTypeNames, headerTypeNamesSeen, u.type);
 		for (v in varIn)
-			collectTypeDef(headerTypes, headerTypeNames, v.type);
+			collectTypeDef(headerTypes, headerTypesSeen, headerTypeNames, headerTypeNamesSeen, v.type);
 		for (v in varOut)
-			collectTypeDef(headerTypes, headerTypeNames, v.type);
+			collectTypeDef(headerTypes, headerTypesSeen, headerTypeNames, headerTypeNamesSeen, v.type);
+		var headerDeclaredTypeNames:Map<String, Bool> = new Map();
+		for (d in headerTypes) {
+			var name = declaredTypeName(d);
+			if (name != null)
+				headerDeclaredTypeNames.set(name, true);
+		}
+		var staticTypeDefs:Map<String, String> = new Map();
+		for (s in statics) {
+			var name = declaredTypeName(s);
+			if (name != null && !staticTypeDefs.exists(name))
+				staticTypeDefs.set(name, s);
+		}
 		for (typeName in headerTypeNames)
-			if (!hasTypeDef(headerTypes, typeName)) {
-				var lifted = findTypeDefInStatics(typeName);
+			if (!headerDeclaredTypeNames.exists(typeName)) {
+				var lifted = staticTypeDefs.get(typeName);
 				if (lifted != null)
-					addUnique(headerTypes, lifted);
+					addUnique(headerTypes, headerTypesSeen, lifted);
 			}
 		for (d in headerTypes) {
 			buf.add(d + "\n");
-			preEmitted.push(d);
+			preEmittedSet.set(d, true);
 		}
 		if (headerTypes.length > 0)
 			buf.add("\n");
@@ -200,14 +176,14 @@ class ShaderSource {
 		}
 
 		// statics
-		var unique = [];
+		var emittedStatics:Map<String, Bool> = new Map();
 		for (s in statics) {
-			if (preEmitted.contains(s))
+			if (preEmittedSet.exists(s))
 				continue;
-			if (unique.contains(s))
+			if (emittedStatics.exists(s))
 				continue;
 			buf.add(s + "\n");
-			unique.push(s);
+			emittedStatics.set(s, true);
 		}
 
 		// body
@@ -218,6 +194,6 @@ class ShaderSource {
 		}
 
 		var result = buf.toString();
-		return format ? formatShaderSource(result) : result;
+		return result;
 	}
 }

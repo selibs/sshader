@@ -12,13 +12,14 @@ using haxe.macro.TypedExprTools;
 
 @:allow(sshader.transpiler.Transpiler)
 class TypeSupport {
-	static final typeDefCache:Map<String, TypeDef> = new Map();
-	static final typeDefBuildInProgress:Map<String, Bool> = new Map();
+	static var typeDefCache:Map<String, TypeDef> = new Map();
+	static var typeDefBuildInProgress:Map<String, Bool> = new Map();
+	static final sanitizeIdentCache:Map<String, String> = new Map();
+	static final shaderSourceClassCache:Map<String, Bool> = new Map();
 	static final shaderSourcePack = ["sshader"];
 	static final shaderSourceName = "ShaderSource";
 
 	static final glslReservedWords = "attribute const uniform varying buffer shared coherent volatile restrict readonly writeonly atomic_uint layout centroid flat smooth noperspective patch sample break continue do for while switch case default if else subroutine in out inout float double int void bool true false invariant discard return mat2 mat3 mat4 dmat2 dmat3 dmat4 mat2x2 mat2x3 mat2x4 mat3x2 mat3x3 mat3x4 mat4x2 mat4x3 mat4x4 dmat2x2 dmat2x3 dmat2x4 dmat3x2 dmat3x3 dmat3x4 dmat4x2 dmat4x3 dmat4x4 vec2 vec3 vec4 ivec2 ivec3 ivec4 bvec2 bvec3 bvec4 uvec2 uvec3 uvec4 dvec2 dvec3 dvec4 lowp mediump highp precision sampler1D sampler2D sampler3D samplerCube sampler1DShadow sampler2DShadow samplerCubeShadow sampler1DArray sampler2DArray sampler1DArrayShadow sampler2DArrayShadow isampler1D isampler2D isampler3D isamplerCube isampler1DArray isampler2DArray usampler1D usampler2D usampler3D usamplerCube usampler1DArray usampler2DArray sampler2DRect sampler2DRectShadow isampler2DRect usampler2DRect samplerBuffer isamplerBuffer usamplerBuffer sampler2DMS isampler2DMS usampler2DMS sampler2DMSArray isampler2DMSArray usampler2DMSArray samplerCubeArray samplerCubeArrayShadow isamplerCubeArray usamplerCubeArray image1D iimage1D uimage1D image2D iimage2D uimage2D image3D iimage3D uimage3D image2DRect iimage2DRect uimage2DRect imageCube iimageCube uimageCube imageBuffer iimageBuffer uimageBuffer image1DArray iimage1DArray uimage1DArray image2DArray iimage2DArray uimage2DArray imageCubeArray iimageCubeArray uimageCubeArray image2DMS iimage2DMS uimage2DMS image2DMSArray iimage2DMSArray uimage2DMSArray struct asm class union enum typedef template this packed goto inline noinline public static extern external interface long short half fixed unsigned superp input output hvec2 hvec3 hvec4 fvec2 fvec3 fvec4 sampler3DRect filter sizeof cast namespace using";
-	static final glslInterfaceTypeWords = "bool int uint float double bvec2 bvec3 bvec4 ivec2 ivec3 ivec4 uvec2 uvec3 uvec4 vec2 vec3 vec4 dvec2 dvec3 dvec4 mat2 mat3 mat4 mat2x2 mat2x3 mat2x4 mat3x2 mat3x3 mat3x4 mat4x2 mat4x3 mat4x4 dmat2 dmat3 dmat4 dmat2x2 dmat2x3 dmat2x4 dmat3x2 dmat3x3 dmat3x4 dmat4x2 dmat4x3 dmat4x4";
 	static inline function hasWord(words:String, word:String):Bool {
 		return (" " + words + " ").indexOf(" " + word + " ") != -1;
 	}
@@ -35,14 +36,13 @@ class TypeSupport {
 	static var curUsedInstanceMembers:Map<String, Map<String, Bool>> = null;
 	static var curUsedStaticMembers:Map<String, Map<String, Bool>> = null;
 	static var curConstructedClasses:Map<String, Bool> = null;
-	static var curAnalyzedMemberDeps:Map<String, Bool> = null;
 	static final noThisMethodCache:Map<String, Bool> = new Map();
 	static final noThisMethodInProgress:Map<String, Bool> = new Map();
 
 	public static function beginEntryContext(owner:ClassType):Dynamic {
-		typeDefCache.clear();
-		typeDefBuildInProgress.clear();
 		var snapshot = {
+			typeDefCache: typeDefCache,
+			typeDefBuildInProgress: typeDefBuildInProgress,
 			entryTypes: curDefinedTypes,
 			dispatchers: curDispatchers,
 			dispatcherSeq: curDispatcherSeq,
@@ -55,9 +55,10 @@ class TypeSupport {
 			inlineNoThisMethods: curInlineNoThisMethods,
 			usedInstanceMembers: curUsedInstanceMembers,
 			usedStaticMembers: curUsedStaticMembers,
-			constructedClasses: curConstructedClasses,
-			analyzedMemberDeps: curAnalyzedMemberDeps
+			constructedClasses: curConstructedClasses
 		};
+		typeDefCache = new Map();
+		typeDefBuildInProgress = new Map();
 		curDefinedTypes = new Map();
 		curDispatchers = new Map();
 		curDispatcherSeq = 0;
@@ -67,11 +68,12 @@ class TypeSupport {
 		curUsedInstanceMembers = new Map();
 		curUsedStaticMembers = new Map();
 		curConstructedClasses = new Map();
-		curAnalyzedMemberDeps = new Map();
 		return snapshot;
 	}
 
 	public static function endEntryContext(snapshot:Dynamic):Void {
+		typeDefCache = snapshot.typeDefCache;
+		typeDefBuildInProgress = snapshot.typeDefBuildInProgress;
 		curDefinedTypes = snapshot.entryTypes;
 		curDispatchers = snapshot.dispatchers;
 		curDispatcherSeq = snapshot.dispatcherSeq;
@@ -85,7 +87,6 @@ class TypeSupport {
 		curUsedInstanceMembers = snapshot.usedInstanceMembers;
 		curUsedStaticMembers = snapshot.usedStaticMembers;
 		curConstructedClasses = snapshot.constructedClasses;
-		curAnalyzedMemberDeps = snapshot.analyzedMemberDeps;
 	}
 
 	static inline function appendAll(dst:Array<String>, src:Array<String>):Void {
@@ -196,6 +197,10 @@ class TypeSupport {
 		return baseTypeName(owner);
 	}
 
+	static inline function classPathKey(type:ClassType):String {
+		return type.pack.join(".") + ":" + type.module + ":" + type.name;
+	}
+
 	static function memberUsageMap(owner:ClassType, isStatic:Bool):Map<String, Bool> {
 		var all = isStatic ? curUsedStaticMembers : curUsedInstanceMembers;
 		if (all == null)
@@ -207,67 +212,6 @@ class TypeSupport {
 			all.set(key, used);
 		}
 		return used;
-	}
-
-	static inline function isMethodField(field:ClassField):Bool {
-		return switch field.kind {
-			case FMethod(_):
-				true;
-			default:
-				false;
-		}
-	}
-
-	static function markMemberDepsFromExpr(expr:TypedExpr):Void {
-		function visit(node:TypedExpr) {
-			switch node.expr {
-				case TField(_, FInstance(c, _, cf)):
-					var owner = c.get();
-					var field = cf.get();
-					markClassFieldUsed(owner, field, false);
-					if (isVarField(field))
-						useUniformField(owner, field);
-				case TField(_, FStatic(c, cf)):
-					var owner = c.get();
-					var field = cf.get();
-					markClassFieldUsed(owner, field, true);
-					if (isVarField(field))
-						useUniformField(owner, field);
-				case TField(_, FClosure(c, cf)):
-					if (c != null)
-						markClassFieldUsed(c.c.get(), cf.get(), false);
-				case TNew(c, _, _):
-					markClassConstructed(c.get());
-				default:
-			}
-			node.iter(visit);
-		}
-		visit(expr);
-	}
-
-	public static function collectUsageFromExpr(expr:TypedExpr):Void {
-		if (expr == null || curUsedInstanceMembers == null || curUsedStaticMembers == null)
-			return;
-		markMemberDepsFromExpr(expr);
-	}
-
-	static function analyzeMemberDeps(owner:ClassType, field:ClassField):Void {
-		if (!isMethodField(field) || curAnalyzedMemberDeps == null)
-			return;
-		var depKey = classFieldKey(owner, field);
-		if (curAnalyzedMemberDeps.exists(depKey))
-			return;
-		curAnalyzedMemberDeps.set(depKey, true);
-		var expr = field.expr();
-		if (expr == null)
-			return;
-		var body = switch expr.expr {
-			case TFunction(func):
-				func.expr;
-			default:
-				expr;
-		}
-		markMemberDepsFromExpr(body);
 	}
 
 	public static function markClassConstructed(type:ClassType):Void {
@@ -284,7 +228,6 @@ class TypeSupport {
 		if (used == null || used.exists(field.name))
 			return;
 		used.set(field.name, true);
-		analyzeMemberDeps(owner, field);
 	}
 
 	public static function isClassFieldUsed(owner:ClassType, field:ClassField, isStatic:Bool):Bool {
@@ -345,11 +288,13 @@ class TypeSupport {
 	}
 
 	public static function isShaderSourceClass(type:ClassType):Bool {
+		var rootKey = classPathKey(type);
+		var cached = shaderSourceClassCache.get(rootKey);
+		if (cached != null)
+			return cached;
 		var seen = new Map<String, Bool>();
-		function keyOf(t:ClassType):String
-			return t.pack.join(".") + ":" + t.module + ":" + t.name;
 		function visit(t:ClassType):Bool {
-			var key = keyOf(t);
+			var key = classPathKey(t);
 			if (seen.exists(key))
 				return false;
 			seen.set(key, true);
@@ -369,7 +314,9 @@ class TypeSupport {
 			var sup = t.superClass;
 			return sup != null && visit(sup.t.get());
 		}
-		return visit(type);
+		var out = visit(type);
+		shaderSourceClassCache.set(rootKey, out);
+		return out;
 	}
 
 	static function unwrapAnalysisExpr(e:TypedExpr):TypedExpr {
@@ -479,80 +426,6 @@ class TypeSupport {
 		return out;
 	}
 
-	static function isTrivialCtorStmt(e:TypedExpr):Bool {
-		var cur = unwrapAnalysisExpr(e);
-		return switch cur.expr {
-			case TReturn(null):
-				true;
-			case TCall(callee, args):
-				var uCallee = unwrapAnalysisExpr(callee);
-				switch uCallee.expr {
-					case TConst(TSuper):
-						args.length == 0;
-					default:
-						false;
-				}
-			case TBlock(el):
-				var ok = true;
-				for (stmt in el)
-					if (!isTrivialCtorStmt(stmt)) {
-						ok = false;
-						break;
-					}
-				ok;
-			default:
-				false;
-		}
-	}
-
-	static function isEmptyCtorBodyExpr(e:TypedExpr):Bool {
-		var cur = unwrapAnalysisExpr(e);
-		return switch cur.expr {
-			case TFunction(func):
-				isEmptyCtorBodyExpr(func.expr);
-			case TBlock(el):
-				var ok = true;
-				for (stmt in el)
-					if (!isTrivialCtorStmt(stmt)) {
-						ok = false;
-						break;
-					}
-				ok;
-			case TReturn(null), TCall(_, _):
-				isTrivialCtorStmt(cur);
-			default:
-				false;
-		}
-	}
-
-	public static function isStatelessTrivialCtorClass(type:ClassType):Bool {
-		var seen = new Map<String, Bool>();
-		function keyOf(t:ClassType):String
-			return t.pack.join(".") + ":" + t.module + ":" + t.name;
-		function visit(t:ClassType):Bool {
-			var key = keyOf(t);
-			if (seen.exists(key))
-				return true;
-			seen.set(key, true);
-			for (field in t.fields.get())
-				switch field.kind {
-					case FVar(_, _):
-						return false;
-					default:
-				}
-			var ctorRef = t.constructor;
-			if (ctorRef != null) {
-				var ctor = ctorRef.get();
-				var ctorExpr = ctor.expr();
-				if (ctorExpr != null && !isEmptyCtorBodyExpr(ctorExpr))
-					return false;
-			}
-			var sup = t.superClass;
-			return sup == null || visit(sup.t.get());
-		}
-		return visit(type);
-	}
-
 	static function implicitUniformFieldName(owner:ClassType, field:ClassField):String {
 		return sanitizeIdent(baseTypeName(owner) + "_" + field.name);
 	}
@@ -587,6 +460,12 @@ class TypeSupport {
 			});
 		}
 		return out;
+	}
+
+	public static function usedUniformNames():Array<String> {
+		if (curUniforms == null || curUniforms.length == 0)
+			return [];
+		return [for (u in curUniforms) u.name];
 	}
 
 	public static function isUniformCandidateField(owner:ClassType, field:ClassField):Bool {
@@ -627,34 +506,6 @@ class TypeSupport {
 		return uniformName;
 	}
 
-	public static function uniformCandidateNames(type:ClassType):Array<String> {
-		var out:Array<String> = [];
-		var used = new Map<String, Bool>();
-		var chain:Array<ClassType> = [];
-		var cur:ClassType = type;
-		while (cur != null) {
-			chain.unshift(cur);
-			var next = cur.superClass;
-			cur = next == null ? null : next.t.get();
-		}
-		function add(owner:ClassType, field:ClassField) {
-			if (!isVarField(field))
-				return;
-			var name = implicitUniformFieldName(owner, field);
-			if (used.exists(name))
-				return;
-			used.set(name, true);
-			out.push(name);
-		}
-		for (t in chain) {
-			for (field in t.fields.get())
-				add(t, field);
-			for (field in t.statics.get())
-				add(t, field);
-		}
-		return out;
-	}
-
 	public static function uniformNameForField(owner:ClassType, field:ClassField):Null<String> {
 		if (curUniformFields == null)
 			return null;
@@ -662,22 +513,27 @@ class TypeSupport {
 	}
 
 	public static function sanitizeIdent(name:String):String {
+		var cached = sanitizeIdentCache.get(name);
+		if (cached != null)
+			return cached;
 		var out = new StringBuf();
+		var prevUnderscore = false;
 		for (i in 0...name.length) {
 			var c = name.charCodeAt(i);
 			var isDigit = c >= "0".code && c <= "9".code;
 			var isUpper = c >= "A".code && c <= "Z".code;
 			var isLower = c >= "a".code && c <= "z".code;
-			if (isDigit || isUpper || isLower || c == "_".code)
-				out.addChar(c);
-			else
-				out.add("_");
+			var normalized = (isDigit || isUpper || isLower || c == "_".code) ? c : "_".code;
+			if (normalized == "_".code) {
+				if (prevUnderscore)
+					continue;
+				prevUnderscore = true;
+			} else prevUnderscore = false;
+			out.addChar(normalized);
 		}
 		var id = out.toString();
 		if (id.length == 0)
 			id = "_";
-		while (id.indexOf("__") != -1)
-			id = StringTools.replace(id, "__", "_");
 		var first = id.charCodeAt(0);
 		if (first >= "0".code && first <= "9".code)
 			id = "_" + id;
@@ -685,6 +541,7 @@ class TypeSupport {
 			id = "_" + id;
 		while (hasWord(glslReservedWords, id))
 			id = "r_" + id;
+		sanitizeIdentCache.set(name, id);
 		return id;
 	}
 
@@ -706,12 +563,6 @@ class TypeSupport {
 		used.set(base, i);
 		used.set(name, 1);
 		return name;
-	}
-
-	public static function isInterfaceVaryingType(type:TypeDef):Bool {
-		if (type == null)
-			return false;
-		return hasWord(glslInterfaceTypeWords, type.name);
 	}
 
 	public static function enumFieldArgs(field:EnumField):Array<{name:String, t:Type}> {
@@ -961,6 +812,8 @@ class TypeSupport {
 			var instanceMethods:Array<ClassField> = [];
 			var staticVars:Array<ClassField> = [];
 			var staticMethods:Array<ClassField> = [];
+			var instanceVarInits = new Map<String, Null<EntryPointBody>>();
+			var staticVarInits = new Map<String, Null<EntryPointBody>>();
 			function applyClassType(t:Type):Type
 				return type.params.length == params.length ? t.applyTypeParameters(type.params, params) : t;
 			function classifyField(field:ClassField, isStatic:Bool) {
@@ -993,9 +846,13 @@ class TypeSupport {
 				if (!isStatic)
 					b.add("\t");
 				b.add(typeDef.name + " " + varName);
-				var initExpr = field.expr();
-				if (initExpr != null) {
-					var init = Transpiler.transExpr(initExpr);
+				var init = isStatic ? staticVarInits.get(field.name) : instanceVarInits.get(field.name);
+				if (init == null) {
+					var initExpr = field.expr();
+					if (initExpr != null)
+						init = Transpiler.transExpr(initExpr);
+				}
+				if (init != null) {
 					appendAll(base.def, init.statics);
 					b.add(" = " + init.expr);
 				}
@@ -1049,27 +906,49 @@ class TypeSupport {
 						Transpiler.transExpr(expr, methodCtx);
 				}
 				appendAll(base.def, body.statics);
-				b.add(retType.name + " " + memberSymbol(base.name, field.name) + "(" + argsDecl.join(", ") + ") ");
-				b.add(Transpiler.wrapFunctionBody(body.expr) + "\n");
+				return retType.name + " " + memberSymbol(base.name, field.name) + "(" + argsDecl.join(", ") + ") " + Transpiler.wrapFunctionBody(body.expr) + "\n";
 			}
 			for (field in type.fields.get())
 				classifyField(field, false);
 			for (field in type.statics.get())
 				classifyField(field, true);
+			var instanceMethodBodies = new Map<String, String>();
+			var staticMethodBodies = new Map<String, String>();
+			var changed = true;
+			while (changed) {
+				changed = false;
+				var constructedNow = isClassConstructed(type);
+				for (field in instanceVars)
+					if ((constructedNow || isClassFieldUsed(type, field, false)) && !instanceVarInits.exists(field.name)) {
+						var initExpr = field.expr();
+						instanceVarInits.set(field.name, initExpr == null ? null : Transpiler.transExpr(initExpr));
+						changed = true;
+					}
+				for (field in staticVars)
+					if (isClassFieldUsed(type, field, true) && !staticVarInits.exists(field.name)) {
+						var initExpr = field.expr();
+						staticVarInits.set(field.name, initExpr == null ? null : Transpiler.transExpr(initExpr));
+						changed = true;
+					}
+				for (field in instanceMethods)
+					if (isClassFieldUsed(type, field, false) && !instanceMethodBodies.exists(field.name)) {
+						instanceMethodBodies.set(field.name, emitMethod(field, false));
+						changed = true;
+					}
+				for (field in staticMethods)
+					if (isClassFieldUsed(type, field, true) && !staticMethodBodies.exists(field.name)) {
+						staticMethodBodies.set(field.name, emitMethod(field, true));
+						changed = true;
+					}
+			}
 			var constructed = isClassConstructed(type);
 			var usedInstanceVars = [
 				for (field in instanceVars)
-					if (constructed || isClassFieldUsed(type, field, false)) field
+					if (constructed || instanceVarInits.exists(field.name)) field
 			];
-			var usedStaticVars = [for (field in staticVars) if (isClassFieldUsed(type, field, true)) field];
-			var usedInstanceMethods = [for (field in instanceMethods) if (isClassFieldUsed(type, field, false)) field];
-			var usedStaticMethods = [for (field in staticMethods) if (isClassFieldUsed(type, field, true)) field];
-			var hasSelfMethods = false;
-			for (field in usedInstanceMethods)
-				if (!isNoThisMethod(type, field)) {
-					hasSelfMethods = true;
-					break;
-				}
+			var usedStaticVars = [for (field in staticVars) if (staticVarInits.exists(field.name)) field];
+			var usedInstanceMethods = [for (field in instanceMethods) if (instanceMethodBodies.exists(field.name)) field];
+			var usedStaticMethods = [for (field in staticMethods) if (staticMethodBodies.exists(field.name)) field];
 			var shouldEmitStruct = usedInstanceVars.length > 0;
 			if (shouldEmitStruct) {
 				b.add("struct " + base.name + " {\n");
@@ -1083,9 +962,9 @@ class TypeSupport {
 			for (field in usedStaticVars)
 				emitVariable(field, true);
 			for (field in usedInstanceMethods)
-				emitMethod(field, false);
+				b.add(instanceMethodBodies.get(field.name));
 			for (field in usedStaticMethods)
-				emitMethod(field, true);
+				b.add(staticMethodBodies.get(field.name));
 			return b.toString();
 		});
 	}
