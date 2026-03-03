@@ -33,75 +33,85 @@ class ShaderBuilder {
 					Context.error(field.name + " must be function", field.pos);
 			}
 		}
-		function typeEntryFunction(field:Field):TFunc {
-			function unwrapTyped(e:TypedExpr):TypedExpr {
-				var cur = e;
-				while (true)
-					switch cur.expr {
-						case TMeta(_, inner):
-							cur = inner;
-						case TParenthesis(inner):
-							cur = inner;
-						case TCast(inner, null):
-							cur = inner;
-						default:
-							return cur;
-					}
-				return cur;
-			}
-			return switch field.kind {
-				case FFun(f):
-					var typed = Context.typeExpr({
-						pos: field.pos,
-						expr: EFunction(FAnonymous, f)
-					});
-					switch unwrapTyped(typed).expr {
-						case TFunction(tf):
-							tf;
-						default:
-							Context.error('Failed to type shader entry "${field.name}"', field.pos);
-							null;
-					}
+		function unwrapTyped(e:TypedExpr):TypedExpr {
+			var cur = e;
+			while (true)
+				switch cur.expr {
+					case TMeta(_, inner):
+						cur = inner;
+					case TParenthesis(inner):
+						cur = inner;
+					case TCast(inner, null):
+						cur = inner;
+					default:
+						return cur;
+				}
+			return cur;
+		}
+		function typeEntryFunction(field:ClassField):TFunc {
+			var methodExpr = field.expr();
+			if (methodExpr == null)
+				Context.error('Failed to type shader entry "${field.name}"', field.pos);
+			return switch unwrapTyped(methodExpr).expr {
+				case TFunction(tf):
+					tf;
 				default:
-					Context.error(field.name + " must be function", field.pos);
+					Context.error('Failed to type shader entry "${field.name}"', field.pos);
 					null;
 			}
 		}
 
-		var vertField:Null<Field> = null;
-		var fragField:Null<Field> = null;
+		var hasVert = false;
+		var hasFrag = false;
 		for (field in fields) {
 			if (field.name == "vert") {
 				patchEntryBody(field);
-				vertField = field;
+				hasVert = true;
 			} else if (field.name == "frag") {
 				patchEntryBody(field);
-				fragField = field;
+				hasFrag = true;
 			}
 		}
-
-		var vertTyped:Null<TFunc> = null;
-		var fragTyped:Null<TFunc> = null;
-		if (vertField != null)
-			vertTyped = typeEntryFunction(vertField);
-		if (fragField != null)
-			fragTyped = typeEntryFunction(fragField);
-
-		var vertLayout = null;
-		if (vertTyped != null) {
-			var src = Transpiler.buildShaderSource(cls, "vert", vertField.pos, vertTyped);
-			File.saveContent(cls.name + ".vert.glsl", src.toString());
-			vertLayout = Transpiler.collectEntryVaryingLayout(vertTyped, vertField.pos);
+		if (hasVert || hasFrag) {
+			var targetModule = cls.module;
+			var targetName = cls.name;
+			Context.onAfterTyping(modules -> {
+				var owner:Null<ClassType> = null;
+				for (m in modules)
+					switch m {
+						case TClassDecl(c):
+							var cur = c.get();
+							if (cur.module == targetModule && cur.name == targetName) {
+								owner = cur;
+								break;
+							}
+						default:
+					}
+				if (owner == null)
+					return;
+				function findEntry(name:String):Null<ClassField> {
+					for (f in owner.fields.get())
+						if (f.name == name)
+							return f;
+					return null;
+				}
+				var vertField = findEntry("vert");
+				var fragField = findEntry("frag");
+				var vertTyped:Null<TFunc> = vertField == null ? null : typeEntryFunction(vertField);
+				var fragTyped:Null<TFunc> = fragField == null ? null : typeEntryFunction(fragField);
+				var vertLayout = null;
+				if (vertTyped != null) {
+					var src = Transpiler.buildShaderSource(owner, "vert", vertField.pos, vertTyped);
+					File.saveContent(owner.name + ".vert.glsl", src.toString());
+					vertLayout = Transpiler.collectEntryVaryingLayout(vertTyped, vertField.pos);
+				}
+				if (fragTyped != null) {
+					var src = Transpiler.buildShaderSource(owner, "frag", fragField.pos, fragTyped, vertLayout);
+					File.saveContent(owner.name + ".frag.glsl", src.toString());
+				}
+			});
 		}
-		if (fragTyped != null) {
-			var src = Transpiler.buildShaderSource(cls, "frag", fragField.pos, fragTyped, vertLayout);
-			File.saveContent(cls.name + ".frag.glsl", src.toString());
-		}
 
-		var out:Array<Field> = [];
-		for (field in fields)
-			if (field.name != "vert" && field.name != "frag")
-				out.push(field);
 		return fields;
 	}
 	#end
