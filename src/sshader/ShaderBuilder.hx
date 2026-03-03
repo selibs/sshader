@@ -2,7 +2,6 @@ package sshader;
 
 #if macro
 import sys.io.File;
-import haxe.io.Bytes;
 import haxe.macro.Context;
 import haxe.macro.Expr;
 import sshader.transpiler.Transpiler;

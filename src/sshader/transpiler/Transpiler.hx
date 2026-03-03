@@ -73,16 +73,17 @@ class Transpiler {
 	static function parseLocation(meta:MetaAccess, i:Int):Int {
 		if (!meta.has("location"))
 			return i;
+
 		var m = meta.extract("location")[0];
 		var params = m.params;
-		if (params == null || params.length == 0) {
-			Context.warning("Value expected", m.pos);
+		if (params == null || params.length == 0)
 			return i;
-		}
+
 		if (params.length > 1) {
 			Context.warning("Too much values", m.pos);
 			return i;
 		}
+
 		return switch params[0].expr {
 			case EConst(CInt(s)):
 				var l = Std.parseInt(s);
@@ -99,18 +100,19 @@ class Transpiler {
 		function getParam(p:String, d:Expr) {
 			if (!meta.has(p))
 				return d;
+
 			var m = meta.extract(p)[0];
 			var params = m.params;
-			if (params == null || params.length == 0) {
-				Context.warning("Value expected", m.pos);
+			if (params == null || params.length == 0)
 				return d;
-			}
+
 			if (params.length > 1) {
 				Context.warning("Too much values", m.pos);
 				return d;
 			}
 			return m.params[0];
 		}
+		
 		function getInterp(q:String) {
 			var aux = getParam(q, macro none);
 			return switch aux.expr {
