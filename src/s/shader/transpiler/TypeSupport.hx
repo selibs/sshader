@@ -1,28 +1,30 @@
-package sshader.transpiler;
+package s.shader.transpiler;
 
 #if macro
 import haxe.macro.Context;
 import haxe.macro.Expr;
 import haxe.macro.Type;
-import sshader.ShaderSource;
-import sshader.transpiler.Types;
+import s.shader.ShaderSource;
+import s.shader.transpiler.Types;
 
 using haxe.macro.TypeTools;
 using haxe.macro.TypedExprTools;
 
-@:allow(sshader.transpiler.Transpiler)
+@:allow(s.shader.transpiler.Transpiler)
 class TypeSupport {
 	static var typeDefCache:Map<String, TypeDef> = new Map();
 	static var typeDefBuildInProgress:Map<String, Bool> = new Map();
 	static final sanitizeIdentCache:Map<String, String> = new Map();
 	static final shaderSourceClassCache:Map<String, Bool> = new Map();
-	static final shaderSourcePack = ["sshader"];
+	static final shaderSourcePack = ["s"];
 	static final shaderSourceName = "ShaderSource";
 
 	static final glslReservedWords = "attribute const uniform varying buffer shared coherent volatile restrict readonly writeonly atomic_uint layout centroid flat smooth noperspective patch sample break continue do for while switch case default if else subroutine in out inout float double int void bool true false invariant discard return mat2 mat3 mat4 dmat2 dmat3 dmat4 mat2x2 mat2x3 mat2x4 mat3x2 mat3x3 mat3x4 mat4x2 mat4x3 mat4x4 dmat2x2 dmat2x3 dmat2x4 dmat3x2 dmat3x3 dmat3x4 dmat4x2 dmat4x3 dmat4x4 vec2 vec3 vec4 ivec2 ivec3 ivec4 bvec2 bvec3 bvec4 uvec2 uvec3 uvec4 dvec2 dvec3 dvec4 lowp mediump highp precision sampler1D sampler2D sampler3D samplerCube sampler1DShadow sampler2DShadow samplerCubeShadow sampler1DArray sampler2DArray sampler1DArrayShadow sampler2DArrayShadow isampler1D isampler2D isampler3D isamplerCube isampler1DArray isampler2DArray usampler1D usampler2D usampler3D usamplerCube usampler1DArray usampler2DArray sampler2DRect sampler2DRectShadow isampler2DRect usampler2DRect samplerBuffer isamplerBuffer usamplerBuffer sampler2DMS isampler2DMS usampler2DMS sampler2DMSArray isampler2DMSArray usampler2DMSArray samplerCubeArray samplerCubeArrayShadow isamplerCubeArray usamplerCubeArray image1D iimage1D uimage1D image2D iimage2D uimage2D image3D iimage3D uimage3D image2DRect iimage2DRect uimage2DRect imageCube iimageCube uimageCube imageBuffer iimageBuffer uimageBuffer image1DArray iimage1DArray uimage1DArray image2DArray iimage2DArray uimage2DArray imageCubeArray iimageCubeArray uimageCubeArray image2DMS iimage2DMS uimage2DMS image2DMSArray iimage2DMSArray uimage2DMSArray struct asm class union enum typedef template this packed goto inline noinline public static extern external interface long short half fixed unsigned superp input output hvec2 hvec3 hvec4 fvec2 fvec3 fvec4 sampler3DRect filter sizeof cast namespace using";
+
 	static inline function hasWord(words:String, word:String):Bool {
 		return (" " + words + " ").indexOf(" " + word + " ") != -1;
 	}
+
 	static var curDefinedTypes:Map<String, Bool> = null;
 	static var curDispatchers:Map<String, FunctionDispatcher> = null;
 	static var curDispatcherSeq:Int = 0;
@@ -528,7 +530,8 @@ class TypeSupport {
 				if (prevUnderscore)
 					continue;
 				prevUnderscore = true;
-			} else prevUnderscore = false;
+			} else
+				prevUnderscore = false;
 			out.addChar(normalized);
 		}
 		var id = out.toString();
@@ -906,7 +909,8 @@ class TypeSupport {
 						Transpiler.transExpr(expr, methodCtx);
 				}
 				appendAll(base.def, body.statics);
-				return retType.name + " " + memberSymbol(base.name, field.name) + "(" + argsDecl.join(", ") + ") " + Transpiler.wrapFunctionBody(body.expr) + "\n";
+				return retType.name + " " + memberSymbol(base.name, field.name) + "(" + argsDecl.join(", ") + ") " + Transpiler.wrapFunctionBody(body.expr)
+					+ "\n";
 			}
 			for (field in type.fields.get())
 				classifyField(field, false);
@@ -947,7 +951,10 @@ class TypeSupport {
 					if (constructed || instanceVarInits.exists(field.name)) field
 			];
 			var usedStaticVars = [for (field in staticVars) if (staticVarInits.exists(field.name)) field];
-			var usedInstanceMethods = [for (field in instanceMethods) if (instanceMethodBodies.exists(field.name)) field];
+			var usedInstanceMethods = [
+				for (field in instanceMethods)
+					if (instanceMethodBodies.exists(field.name)) field
+			];
 			var usedStaticMethods = [for (field in staticMethods) if (staticMethodBodies.exists(field.name)) field];
 			var shouldEmitStruct = usedInstanceVars.length > 0;
 			if (shouldEmitStruct) {

@@ -1,6 +1,6 @@
 package;
 
-import sshader.Shader;
+import s.shader.Shader;
 
 class Test implements Shader {
 	var vertPos:Float;

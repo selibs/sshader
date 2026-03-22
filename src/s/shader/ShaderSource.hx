@@ -1,4 +1,4 @@
-package sshader;
+package s;
 
 enum AuxInterp {
 	NONE;
@@ -60,13 +60,13 @@ class ShaderSource {
 						case CENTROID: " centroid";
 						case SAMPLE: " sample";
 					}
-					case NOPERSPECTIVE(v):
-						"noperspective" + switch v {
-							case NONE: "";
-							case CENTROID: " centroid";
-							case SAMPLE: " sample";
-						}
-				}
+				case NOPERSPECTIVE(v):
+					"noperspective" + switch v {
+						case NONE: "";
+						case CENTROID: " centroid";
+						case SAMPLE: " sample";
+					}
+			}
 			var allowInterp = switch stage {
 				case "vert":
 					d == "out";

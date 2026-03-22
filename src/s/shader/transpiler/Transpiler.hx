@@ -1,11 +1,11 @@
-package sshader.transpiler;
+package s.shader.transpiler;
 
 #if macro
 import haxe.macro.Context;
 import haxe.macro.Expr;
 import haxe.macro.Type;
-import sshader.ShaderSource;
-import sshader.transpiler.Types;
+import s.shader.ShaderSource;
+import s.shader.transpiler.Types;
 
 using haxe.macro.TypeTools;
 using haxe.macro.TypedExprTools;
@@ -25,10 +25,9 @@ class Transpiler {
 
 	static inline function isGlslInterfaceTypeName(name:String):Bool {
 		return switch name {
-			case "bool", "int", "uint", "float", "double", "bvec2", "bvec3", "bvec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3", "uvec4", "vec2",
-				"vec3", "vec4", "dvec2", "dvec3", "dvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2",
-				"mat4x3", "mat4x4", "dmat2", "dmat3", "dmat4", "dmat2x2", "dmat2x3", "dmat2x4", "dmat3x2", "dmat3x3", "dmat3x4", "dmat4x2", "dmat4x3",
-				"dmat4x4":
+			case "bool", "int", "uint", "float", "double", "bvec2", "bvec3", "bvec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3", "uvec4", "vec2", "vec3",
+				"vec4", "dvec2", "dvec3", "dvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2", "mat4x3",
+				"mat4x4", "dmat2", "dmat3", "dmat4", "dmat2x2", "dmat2x3", "dmat2x4", "dmat3x2", "dmat3x3", "dmat3x4", "dmat4x2", "dmat4x3", "dmat4x4":
 				true;
 			default:
 				false;
@@ -91,6 +90,7 @@ class Transpiler {
 				i;
 		}
 	}
+
 	static function parseInterp(meta:MetaAccess):VaryingInterp {
 		function getParam(p:String, d:Expr) {
 			if (!meta.has(p))
@@ -107,7 +107,7 @@ class Transpiler {
 			}
 			return m.params[0];
 		}
-		
+
 		function getInterp(q:String) {
 			var aux = getParam(q, macro none);
 			return switch aux.expr {
@@ -128,15 +128,10 @@ class Transpiler {
 					NONE;
 			}
 		}
-		return if (meta.has("flat"))
-			FLAT;
-		else if (meta.has("smooth"))
-			SMOOTH(getInterp("smooth"));
-		else if (meta.has("noperspective"))
-			NOPERSPECTIVE(getInterp("noperspective"));
-		else
-			SMOOTH(NONE);
+		return if (meta.has("flat")) FLAT; else if (meta.has("smooth")) SMOOTH(getInterp("smooth")); else if (meta.has("noperspective"))
+			NOPERSPECTIVE(getInterp("noperspective")); else SMOOTH(NONE);
 	}
+
 	static inline function hasInterpMeta(meta:MetaAccess):Bool {
 		return meta.has("flat") || meta.has("smooth") || meta.has("noperspective");
 	}
@@ -194,7 +189,12 @@ class Transpiler {
 		}>, forFragInput:Bool, kind:String) {
 			var varyings = [];
 			var vertOutByName = new Map<String, Int>();
-			var vertOutByLocation = new Map<Int, {name:String, typeSig:String, typeName:String, interp:VaryingInterp}>();
+			var vertOutByLocation = new Map<Int, {
+				name:String,
+				typeSig:String,
+				typeName:String,
+				interp:VaryingInterp
+			}>();
 			var usedLocationNames = new Map<Int, String>();
 			if (forFragInput && vertOutLayout != null) {
 				for (v in vertOutLayout) {
@@ -738,13 +738,13 @@ class Transpiler {
 					if (c.get().isExtern || cf.get().meta.has(":native")) {
 						target: TypeSupport.fieldNativeName(cf.get()),
 						captures: []
-						} else {
-							var className = addClassType(c, []);
-							{
-								target: TypeSupport.memberSymbol(className, cf.get().name),
-								captures: []
-							};
-						}
+					} else {
+						var className = addClassType(c, []);
+						{
+							target: TypeSupport.memberSymbol(className, cf.get().name),
+							captures: []
+						};
+					}
 				case TField(_, FEnum(enumRef, ef)):
 					var enumTypeName = addTypeDef(TypeSupport.defEnum(enumRef.get(), []));
 					{
@@ -769,19 +769,19 @@ class Transpiler {
 							target: ensureNoThisInlineMethod(owner, cf.get()),
 							captures: []
 						};
-						} else if (isNoThisMethod(owner, cf.get())) {
-							var className = addClassType(c, params);
-							{
-								target: TypeSupport.memberSymbol(className, cf.get().name),
-								captures: []
-							};
-						} else {
-							var className = addClassType(c, params);
-							{
-								target: TypeSupport.memberSymbol(className, cf.get().name),
-								captures: [{t: target.t, expr: addInline(target)}]
-							};
-						}
+					} else if (isNoThisMethod(owner, cf.get())) {
+						var className = addClassType(c, params);
+						{
+							target: TypeSupport.memberSymbol(className, cf.get().name),
+							captures: []
+						};
+					} else {
+						var className = addClassType(c, params);
+						{
+							target: TypeSupport.memberSymbol(className, cf.get().name),
+							captures: [{t: target.t, expr: addInline(target)}]
+						};
+					}
 				case TField(target, FClosure(c, cf)):
 					switch c {
 						case null:
@@ -805,19 +805,19 @@ class Transpiler {
 									target: ensureNoThisInlineMethod(owner, cf.get()),
 									captures: []
 								};
-								} else if (isNoThisMethod(owner, cf.get())) {
-									var className = addClassType(cc.c, cc.params);
-									{
-										target: TypeSupport.memberSymbol(className, cf.get().name),
-										captures: []
-									};
-								} else {
-									var className = addClassType(cc.c, cc.params);
-									{
-										target: TypeSupport.memberSymbol(className, cf.get().name),
-										captures: [{t: target.t, expr: addInline(target)}]
-									};
-								}
+							} else if (isNoThisMethod(owner, cf.get())) {
+								var className = addClassType(cc.c, cc.params);
+								{
+									target: TypeSupport.memberSymbol(className, cf.get().name),
+									captures: []
+								};
+							} else {
+								var className = addClassType(cc.c, cc.params);
+								{
+									target: TypeSupport.memberSymbol(className, cf.get().name),
+									captures: [{t: target.t, expr: addInline(target)}]
+								};
+							}
 					}
 				default:
 					Context.error("Unsupported function value", u.pos);
@@ -1027,11 +1027,11 @@ class Transpiler {
 						if (isVarField(field))
 							assertNonLocalVarAccess(field, owner, expr.pos);
 						var uniformName = TypeSupport.uniformNameForField(owner, field);
-							if (uniformName != null) buf.add(ensureUniformLocal(owner, field, uniformName,
-								field.type)); else if (owner.isExtern || field.meta.has(":native")) buf.add(TypeSupport.fieldNativeName(field)); else {
-								var className = addClassType(c, []);
-								buf.add(TypeSupport.memberSymbol(className, field.name));
-							}
+						if (uniformName != null) buf.add(ensureUniformLocal(owner, field, uniformName,
+							field.type)); else if (owner.isExtern || field.meta.has(":native")) buf.add(TypeSupport.fieldNativeName(field)); else {
+							var className = addClassType(c, []);
+							buf.add(TypeSupport.memberSymbol(className, field.name));
+						}
 					case FAnon(cf):
 						buf.add(addInline(e) + "." + TypeSupport.sanitizeIdent(cf.get().name));
 					case FDynamic(s):
@@ -1042,13 +1042,13 @@ class Transpiler {
 							var owner = c.c.get();
 							if (owner.isExtern || cf.get().meta.has(":native"))
 								buf.add(TypeSupport.fieldNativeName(cf.get()));
-								else if (isNoThisInlineMethod(owner, cf.get()))
-									buf.add(ensureNoThisInlineMethod(owner, cf.get()));
-								else {
-									var ownerName = addClassType(c.c, c.params);
-									buf.add(TypeSupport.memberSymbol(ownerName, cf.get().name));
-								}
+							else if (isNoThisInlineMethod(owner, cf.get()))
+								buf.add(ensureNoThisInlineMethod(owner, cf.get()));
+							else {
+								var ownerName = addClassType(c.c, c.params);
+								buf.add(TypeSupport.memberSymbol(ownerName, cf.get().name));
 							}
+						}
 					case FEnum(enumRef, ef):
 						var enumTypeName = addTypeDef(TypeSupport.defEnum(enumRef.get(), []));
 						var ctorName = enumTypeName + "_" + ef.name;
@@ -1110,17 +1110,17 @@ class Transpiler {
 									.meta.has(":native")) buf.add(addInline(target) + "." + TypeSupport.fieldNativeName(cf.get()) + "(" + args.join(", ") +
 										")"); else {
 									var owner = c.get();
-										if (isNoThisInlineMethod(owner, cf.get()))
-											buf.add(ensureNoThisInlineMethod(owner, cf.get()) + "(" + args.join(", ") + ")");
-										else if (isNoThisMethod(owner, cf.get())) {
-											var className = addClassType(c, params);
-											buf.add(TypeSupport.memberSymbol(className, cf.get().name) + "(" + args.join(", ") + ")");
-										} else {
-											var className = addClassType(c, params);
-											args.unshift(addInline(target));
-											buf.add(TypeSupport.memberSymbol(className, cf.get().name) + "(" + args.join(", ") + ")");
-										}
+									if (isNoThisInlineMethod(owner, cf.get()))
+										buf.add(ensureNoThisInlineMethod(owner, cf.get()) + "(" + args.join(", ") + ")");
+									else if (isNoThisMethod(owner, cf.get())) {
+										var className = addClassType(c, params);
+										buf.add(TypeSupport.memberSymbol(className, cf.get().name) + "(" + args.join(", ") + ")");
+									} else {
+										var className = addClassType(c, params);
+										args.unshift(addInline(target));
+										buf.add(TypeSupport.memberSymbol(className, cf.get().name) + "(" + args.join(", ") + ")");
 									}
+								}
 							case FVar(_, _):
 								assertNonLocalVarAccess(cf.get(), c.get(), callee.pos);
 								emitDispatch();
@@ -1134,14 +1134,12 @@ class Transpiler {
 								assertNonLocalVarAccess(cf.get(), c.get(), callee.pos);
 								emitDispatch();
 						}
-						case TField(_, FEnum(_, _)):
-							buf.add(addInline(callee) + "(" + args.join(", ") + ")");
-						default:
-							if (isFunctionType(callee.t) || isFunctionValueCallee(callee))
-								emitDispatch();
-							else
-								buf.add(addInline(callee) + "(" + args.join(", ") + ")");
-					}
+					case TField(_, FEnum(_, _)):
+						buf.add(addInline(callee) + "(" + args.join(", ") + ")");
+					default:
+						if (isFunctionType(callee.t) || isFunctionValueCallee(callee)) emitDispatch(); else buf.add(addInline(callee) + "("
+							+ args.join(", ") + ")");
+				}
 			case TNew(c, params, el):
 				TypeSupport.markClassConstructed(c.get());
 				var typeName = addClassType(c, params);
@@ -1480,7 +1478,10 @@ class Transpiler {
 	}
 
 	static function dispatcherDeclInsertIndex(statics:Array<String>):Int {
-		if (TypeSupport.curDispatchers == null || !TypeSupport.curDispatchers.iterator().hasNext() || statics == null || statics.length == 0)
+		if (TypeSupport.curDispatchers == null
+			|| !TypeSupport.curDispatchers.iterator().hasNext()
+			|| statics == null
+			|| statics.length == 0)
 			return 0;
 		function isBuiltinTypeName(name:String):Bool {
 			if (name == null || name.length == 0)

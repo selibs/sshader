@@ -1,11 +1,11 @@
-package sshader;
+package s;
 
 #if macro
 import sys.io.File;
 import haxe.macro.Context;
 import haxe.macro.Expr;
 import haxe.macro.Type;
-import sshader.transpiler.Transpiler;
+import s.shader.transpiler.Transpiler;
 #end
 
 class ShaderBuilder {

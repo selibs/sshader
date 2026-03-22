@@ -1,6 +1,6 @@
-package sshader.transpiler;
+package s.shader.transpiler;
 
-import sshader.ShaderSource;
+import s.shader.ShaderSource;
 
 #if macro
 typedef EntryPointBody = {
